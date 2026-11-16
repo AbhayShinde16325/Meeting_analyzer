@@ -60,6 +60,8 @@ class TranscriptionPipeline:
         self._engine = engine
         self._transcription_service = transcription_service
         self._summarizer = summarizer
+        # Per-instance progress throttle state: job id -> last monotonic update.
+        self._progress_log: dict[str, float] = {}
 
     # -- job execution ------------------------------------------------------
 
@@ -354,8 +356,6 @@ class TranscriptionPipeline:
                 )
         except Exception:  # progress updates must never kill a job
             logger.exception("Could not record progress for job %s.", job_id)
-
-    _progress_log: dict[str, float] = {}
 
     def _is_job_cancelled(self, job_id: str) -> bool:
         with self._engine.connect() as conn:
