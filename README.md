@@ -57,6 +57,22 @@ Implemented in this repository:
 
 ### Server host
 
+#### Option A (recommended): one command
+
+With Docker Desktop installed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+The script checks prerequisites, creates `.env` (generating the database
+password and host token; prompting for the Sarvam/Groq keys), starts the
+PostgreSQL container (`docker compose up -d db`, data in a persistent
+volume), installs dependencies, and applies the schema. Re-running it is
+safe: it never deletes data. Generated secrets are printed once — save them.
+
+#### Option B: manual
+
 1. Install PostgreSQL and create a database and role for the app.
 2. Create a virtual environment and install dependencies:
 
