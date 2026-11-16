@@ -8,3 +8,9 @@ __pycache__/
 
 # Virtual environment
 .venv/
+
+# Local scratch PostgreSQL cluster used by tests
+.pytest_pg/
+
+# Command Code local tool state
+.commandcode/

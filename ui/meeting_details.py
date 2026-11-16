@@ -1,4 +1,10 @@
-"""Meeting detail view: playback, transcript, and structured analysis."""
+"""Meeting detail view: playback, transcript, summary and attachments.
+
+All data comes from the server API.  Audio playback downloads the stored
+recording (Large Object) into a local cache once, then plays it from disk so
+seeking works without re-streaming.  Transcription/analysis are queued on the
+server and polled with a timer; cancellation is a server-side job cancel.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -24,9 +30,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from client.api_client import (
+    ApiClientError,
+    ApiConnectionError,
+    TeamMeetingAIClient,
+)
 from config import Settings
-from storage import library as ops
-from storage.library import MeetingLibrary
+from ui.qt_utils import worker_running
 
 try:  # PySide6 multimedia is included in the standard wheel.
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -40,13 +50,19 @@ except Exception:  # pragma: no cover - platform packaging fallback
 
 _STATUS_LABELS = {
     "recording": "Recording in progress",
-    "recorded": "Recorded - not processed",
+    "recorded": "Recorded - transcription queued",
     "transcribed": "Transcribed - analysis pending",
-    "transcribing": "Transcribing",
     "analyzing": "Analyzing",
     "completed": "Complete",
     "failed": "Failed",
 }
+
+_CLOUD_WARNING = (
+    "Transcription runs on Sarvam's cloud service: the meeting audio is "
+    "uploaded to Sarvam when transcription is queued. Analysis (this summary) "
+    "is generated with an external language model from the transcript. Do not "
+    "record confidential meetings unless your organisation permits this."
+)
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -60,12 +76,17 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes}m {secs}s"
 
 
-def _format_datetime(value: datetime | None) -> str:
+def _format_datetime(value: str | datetime | None) -> str:
     if value is None:
         return "Unknown date"
-    return value.replace(tzinfo=timezone.utc).astimezone().strftime(
-        "%A, %d %B %Y at %H:%M"
-    )
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return str(value)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone().strftime("%A, %d %B %Y at %H:%M")
 
 
 def _format_size(size: int | None) -> str:
@@ -88,36 +109,155 @@ def _timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-class MeetingDetailsScreen(QWidget):
-    back_requested = Signal()
-    transcribe_requested = Signal(str)
-    analysis_requested = Signal(str)
-    cancel_requested = Signal()
+class _DetailsWorker(QThread):
+    """Fetch everything this screen renders, off the UI thread."""
+
+    completed = Signal(object, object)  # details dict, error or None
+
+    def __init__(self, client: TeamMeetingAIClient, meeting_id: str) -> None:
+        super().__init__()
+        self.client = client
+        self.meeting_id = meeting_id
+
+    def run(self) -> None:
+        try:
+            details = {
+                "meeting": self.client.get_meeting(self.meeting_id),
+                "files": self.client.list_files(self.meeting_id),
+                "transcripts": self.client.list_transcripts(self.meeting_id),
+                "summary": self.client.get_summary(self.meeting_id),
+                "action_items": self.client.list_action_items(self.meeting_id),
+                "jobs": self.client.list_jobs(self.meeting_id),
+            }
+        except (ApiClientError, ApiConnectionError) as exc:
+            self.completed.emit(None, str(exc))
+        except Exception as exc:
+            self.completed.emit(None, f"Unexpected error: {type(exc).__name__}: {exc}")
+        else:
+            self.completed.emit(details, None)
+
+
+class _DownloadWorker(QThread):
+    """Download a stored file (audio/attachment) into a local cache."""
+
+    completed = Signal(object, object, object)  # file row, path, error or None
 
     def __init__(
         self,
-        library: MeetingLibrary,
+        client: TeamMeetingAIClient,
+        file_row: dict[str, Any],
+        cache_dir: Path,
+    ) -> None:
+        super().__init__()
+        self.client = client
+        self.file_row = file_row
+        self.cache_dir = cache_dir
+
+    def run(self) -> None:
+        sha = str(self.file_row.get("sha256", ""))
+        filename = self.file_row.get("original_filename") or f"file-{self.file_row['id']}"
+        target = self.cache_dir / f"{sha[:16]}-{filename}"
+        try:
+            self.client.download_file(str(self.file_row["id"]), target)
+        except (ApiClientError, ApiConnectionError) as exc:
+            self.completed.emit(self.file_row, None, str(exc))
+        except Exception as exc:
+            self.completed.emit(
+                self.file_row, None, f"Unexpected error: {type(exc).__name__}: {exc}"
+            )
+        else:
+            self.completed.emit(self.file_row, target, None)
+
+
+class _JobActionWorker(QThread):
+    """One-shot job mutation: queue transcribe/analyse or cancel a job."""
+
+    completed = Signal(object, object)  # result, error or None
+
+    def __init__(self, client: TeamMeetingAIClient, action: str, **kwargs: Any) -> None:
+        super().__init__()
+        self.client = client
+        self.action = action
+        self.kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            if self.action == "transcribe":
+                result = self.client.transcribe(self.kwargs["meeting_id"])
+            elif self.action == "analyse":
+                result = self.client.analyse(self.kwargs["meeting_id"])
+            elif self.action == "cancel":
+                result = self.client.cancel_job(
+                    self.kwargs["meeting_id"], self.kwargs["job_id"]
+                )
+            else:  # pragma: no cover - guarded by caller
+                raise ValueError(f"Unknown action {self.action!r}")
+        except (ApiClientError, ApiConnectionError) as exc:
+            self.completed.emit(None, str(exc))
+        except Exception as exc:
+            self.completed.emit(None, f"Unexpected error: {type(exc).__name__}: {exc}")
+        else:
+            self.completed.emit(result, None)
+
+
+class _JobPollWorker(QThread):
+    """Poll the meeting's job list while the processing timer is active."""
+
+    completed = Signal(list, object)
+
+    def __init__(self, client: TeamMeetingAIClient, meeting_id: str) -> None:
+        super().__init__()
+        self.client = client
+        self.meeting_id = meeting_id
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self.client.list_jobs(self.meeting_id), None)
+        except Exception as exc:  # polling errors are non-fatal
+            self.completed.emit([], f"{type(exc).__name__}: {exc}")
+
+
+class MeetingDetailsScreen(QWidget):
+    back_requested = Signal()
+    meeting_updated = Signal()  # dashboard should refresh its list
+
+    def __init__(
+        self,
+        client: TeamMeetingAIClient,
         settings: Settings,
         parent: QWidget | None = None,
         *,
-        analysis_available: bool = False,
-        cloud_analysis: bool = False,
+        can_process: bool = True,
     ) -> None:
         super().__init__(parent)
-        self.library = library
+        self.client = client
         self.settings = settings
-        self._analysis_available = analysis_available
-        self._cloud_analysis = cloud_analysis
+        self.current_user: dict[str, Any] | None = None
+        self._can_process = can_process  # host-only actions
         self._meeting_id: str | None = None
         self._details: dict[str, Any] | None = None
         self._processing = False
+        # The job this screen just queued.  The cached details snapshot is
+        # stale for a moment after queueing, so cancelling has to use this id
+        # rather than the previous job list.
+        self._active_job_id: str | None = None
         self._player = None
         self._audio_output = None
+
+        self._details_worker: _DetailsWorker | None = None
+        self._download_worker: _DownloadWorker | None = None
+        self._action_worker: _JobActionWorker | None = None
+        self._poll_worker: _JobPollWorker | None = None
+        self._audio_file_id: str | None = None
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(3000)
+        self._poll_timer.timeout.connect(self._poll_jobs)
 
         self._build_ui()
         self._setup_player()
 
-    # -- UI construction ----------------------------------------------
+    # -- UI construction -------------------------------------------------
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -141,44 +281,52 @@ class MeetingDetailsScreen(QWidget):
         self.meta_label.setWordWrap(True)
         layout.addWidget(self.meta_label)
 
-        self.cloud_warning = QLabel("")
+        self.cloud_warning = QLabel(_CLOUD_WARNING)
         self.cloud_warning.setObjectName("consentText")
         self.cloud_warning.setWordWrap(True)
-        self.cloud_warning.setVisible(False)
         layout.addWidget(self.cloud_warning)
 
         actions = QHBoxLayout()
         self.play_button = QPushButton("Play recording")
-        self.play_button.setToolTip("Play the meeting recording.")
+        self.play_button.setToolTip(
+            "Download the recording from the server (once) and play it."
+        )
         self.play_button.clicked.connect(self._toggle_playback)
         self.play_button.setEnabled(False)
 
         self.transcribe_button = QPushButton("Transcribe recording")
         self.transcribe_button.setObjectName("primaryButton")
-        self.transcribe_button.setToolTip("Transcribe the recording locally (creates transcript.md).")
+        self.transcribe_button.setToolTip(
+            "Queue transcription on the server (Sarvam cloud, Whisper fallback)."
+        )
         self.transcribe_button.clicked.connect(self._request_transcription)
         self.transcribe_button.setEnabled(False)
 
         self.analyse_button = QPushButton("Analyse transcript")
-        self.analyse_button.setToolTip("Generate meeting notes and action items.")
+        self.analyse_button.setToolTip(
+            "Queue meeting analysis on the server from the primary transcript."
+        )
         self.analyse_button.clicked.connect(self._request_analysis)
         self.analyse_button.setEnabled(False)
 
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton("Cancel job")
         self.cancel_button.clicked.connect(self._request_cancel)
         self.cancel_button.setVisible(False)
 
-        self.open_folder_button = QPushButton("Open folder")
-        self.open_folder_button.setToolTip("Open the meeting folder with recording and notes.")
-        self.open_folder_button.setEnabled(False)
-        self.open_folder_button.clicked.connect(self._open_meeting_folder)
+        self.export_button = QPushButton("Export ZIP")
+        self.export_button.setToolTip(
+            "Download the meeting (metadata, transcript, summary, attachments, "
+            "audio) as a ZIP file."
+        )
+        self.export_button.clicked.connect(self._export_meeting)
+        self.export_button.setEnabled(False)
 
         actions.addWidget(self.play_button)
         actions.addWidget(self.transcribe_button)
         actions.addWidget(self.analyse_button)
         actions.addWidget(self.cancel_button)
         actions.addStretch(1)
-        actions.addWidget(self.open_folder_button)
+        actions.addWidget(self.export_button)
         layout.addLayout(actions)
 
         self.notice_label = QLabel("")
@@ -238,26 +386,53 @@ class MeetingDetailsScreen(QWidget):
         self.transcript_browser.setObjectName("detailBrowser")
         self.tabs.addTab(self.transcript_browser, "Transcript")
 
+        # Attachments tab: documents stored with the meeting.
+        attachments_widget = QWidget()
+        attachments_layout = QVBoxLayout(attachments_widget)
+        attachments_layout.setContentsMargins(0, 8, 0, 0)
+        attachments_layout.setSpacing(6)
+
+        self.attachments_table = QTableWidget(0, 4)
+        self.attachments_table.setHorizontalHeaderLabels(
+            ["File", "Type", "Size", "Uploaded"]
+        )
+        self.attachments_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.attachments_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.attachments_table.verticalHeader().setVisible(False)
+        attach_header = self.attachments_table.horizontalHeader()
+        attach_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        attach_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        attach_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        attach_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        attachments_layout.addWidget(self.attachments_table, 1)
+
+        attach_buttons = QHBoxLayout()
+        self.no_attachments_label = QLabel("No attachments on this meeting.")
+        self.no_attachments_label.setObjectName("muted")
+        attachments_layout.addWidget(self.no_attachments_label)
+        self.open_attachment_button = QPushButton("Download && open")
+        self.open_attachment_button.clicked.connect(self._open_selected_attachment)
+        self.open_attachment_button.setEnabled(False)
+        attach_buttons.addStretch(1)
+        attach_buttons.addWidget(self.open_attachment_button)
+        attachments_layout.addLayout(attach_buttons)
+        self.attachments_table.itemSelectionChanged.connect(self._update_attachment_actions)
+        self.attachments_table.itemDoubleClicked.connect(
+            lambda _item: self._open_selected_attachment()
+        )
+
+        self.tabs.addTab(attachments_widget, "Attachments")
+
         self.status_label = QLabel("")
         self.status_label.setObjectName("muted")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         self._render_empty_state("Select a meeting to view its details.")
-        self._update_cloud_warning()
-
-    def _update_cloud_warning(self) -> None:
-        if self._cloud_analysis:
-            self.cloud_warning.setText(
-                "Cloud analysis is enabled: the meeting transcript (not the "
-                "audio) is sent to an external service for processing and "
-                "leaves this computer. Do not enable this for confidential "
-                "meetings unless your organisation permits it."
-            )
-            self.cloud_warning.setVisible(True)
-        else:
-            self.cloud_warning.setText("")
-            self.cloud_warning.setVisible(False)
 
     def _setup_player(self) -> None:
         if not _MULTIMEDIA_AVAILABLE:
@@ -268,61 +443,105 @@ class MeetingDetailsScreen(QWidget):
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
         self._player.errorOccurred.connect(self._on_player_error)
 
-    # -- loading -------------------------------------------------------
+    # -- loading ---------------------------------------------------------
 
     def show_meeting(self, meeting_id: str) -> None:
         self._meeting_id = meeting_id
         self._processing = False
         self.cancel_button.setVisible(False)
         self.status_label.setText("")
+        self._poll_timer.stop()
         self.reload()
 
     def reload(self) -> None:
         if self._meeting_id is None:
             return
-        if not self._processing:
-            self._show_notice("")
-        try:
-            details = ops.get_meeting_details(self.library, self._meeting_id)
-        except Exception as exc:
-            self._show_notice(f"Could not load the meeting: {exc}", error=True)
+        if worker_running(self._details_worker):
             return
-        if details is None:
+        self._details_worker = _DetailsWorker(self.client, self._meeting_id)
+        self._details_worker.completed.connect(self._on_details_loaded)
+        self._details_worker.finished.connect(self._details_worker.deleteLater)
+        self._details_worker.start()
+
+    def _primary_transcript(self, details: dict[str, Any]) -> dict[str, Any] | None:
+        transcripts = details.get("transcripts") or []
+        for transcript in transcripts:
+            if transcript.get("is_primary"):
+                return transcript
+        return transcripts[0] if transcripts else None
+
+    def _original_audio(self, details: dict[str, Any]) -> dict[str, Any] | None:
+        for row in details.get("files") or []:
+            if row.get("kind") == "original_audio_48k":
+                return row
+        return None
+
+    def _attachments(self, details: dict[str, Any]) -> list[dict[str, Any]]:
+        return [f for f in details.get("files") or [] if f.get("kind") == "attachment"]
+
+    def _on_details_loaded(self, details: object, error: object) -> None:
+        self._details_worker = None
+        if error:
+            self._show_notice(f"Could not load the meeting: {error}", error=True)
+            return
+        assert isinstance(details, dict)
+        if not details.get("meeting"):
             self._show_notice("That meeting could not be found.", error=True)
             self._render_empty_state("Meeting not found.")
             return
 
         self._details = details
-        self.title_label.setText(str(details.get("title", "Untitled meeting")))
-        recording = details.get("recording") or {}
+        meeting = details["meeting"]
+        self.title_label.setText(str(meeting.get("title", "Untitled meeting")))
+        audio = self._original_audio(details)
+        duration_seconds = None
+        if meeting.get("duration_ms"):
+            duration_seconds = meeting["duration_ms"] / 1000.0
         meta_parts = [
-            _format_datetime(details.get("started_at")),
-            _format_duration(details.get("duration_seconds")),
+            _format_datetime(meeting.get("recorded_at")),
+            _format_duration(duration_seconds),
             _STATUS_LABELS.get(
-                str(details.get("status", "")),
-                str(details.get("status", "")).replace("_", " ").title(),
+                str(meeting.get("status", "")),
+                str(meeting.get("status", "")).replace("_", " ").title(),
             ),
         ]
-        size_text = _format_size(recording.get("size_bytes"))
-        if size_text:
-            meta_parts.append(size_text)
+        if audio:
+            meta_parts.append(_format_size(audio.get("size_bytes")))
         self.meta_label.setText("  |  ".join(meta_parts))
 
         self._render_overview(details)
         self._render_transcript(details)
         self._render_actions(details)
+        self._render_attachments(details)
         self._update_controls()
 
-        message = details.get("error_message")
-        if message and details.get("status") == "failed":
+        jobs = details.get("jobs") or []
+        active = [j for j in jobs if j.get("status") in ("queued", "running")]
+        if active:
+            job = active[0]
+            self._processing = True
+            self.cancel_button.setVisible(True)
+            self.status_label.setText(
+                f"{job.get('job_type', 'job').title()} {job.get('status', '')} "
+                f"({int(float(job.get('progress', 0)) * 100)}%) - "
+                f"{job.get('message') or 'working...'}"
+            )
+            self._poll_timer.start()
+        elif meeting.get("status") == "failed":
+            failed_jobs = [j for j in jobs if j.get("status") == "failed"]
+            message = (
+                failed_jobs[0].get("error") if failed_jobs else None
+            ) or "Processing failed."
             self._show_notice(str(message), error=True)
+
+    # -- rendering (unchanged presentation) ---------------------------------
 
     def _render_overview(self, details: dict[str, Any]) -> None:
         summary = details.get("summary")
-        transcript = details.get("transcript")
+        transcript = self._primary_transcript(details)
         if not summary:
             if transcript:
-                if self._analysis_available:
+                if self._can_process:
                     body = (
                         "<p>This meeting has a transcript but has not been "
                         "analysed yet. Click <b>Analyse transcript</b> above "
@@ -330,14 +549,14 @@ class MeetingDetailsScreen(QWidget):
                     )
                 else:
                     body = (
-                        "<p>This meeting has a transcript. No analysis backend "
-                        "is configured, so a summary cannot be generated.</p>"
+                        "<p>This meeting has a transcript. Analysis can only "
+                        "be queued from the meeting host computer.</p>"
                     )
             else:
                 body = (
                     "<p>This meeting has not been processed yet. Use the "
-                    "<b>Transcribe recording</b> button above to create a "
-                    "transcript from the recording.</p>"
+                    "<b>Transcribe recording</b> button above to queue "
+                    "transcription on the server.</p>"
                 )
             self.overview_browser.setHtml(self._wrap_html(body))
             return
@@ -346,18 +565,19 @@ class MeetingDetailsScreen(QWidget):
         overview = html.escape(str(summary.get("overview", ""))).replace("\n", "<br>")
         parts.append(f"<h2>Overview</h2><p>{overview}</p>")
 
-        parts.append(self._render_html_list("Key points", summary.get("key_points")))
-        parts.append(self._render_html_list("Decisions", summary.get("decisions")))
+        payload = summary.get("payload") or {}
+        parts.append(self._render_html_list("Key points", payload.get("key_points")))
+        parts.append(self._render_html_list("Decisions", payload.get("decisions")))
         parts.append(
-            self._render_html_list("Open questions", summary.get("open_questions"))
+            self._render_html_list("Open questions", payload.get("open_questions"))
         )
         parts.append(
             self._render_html_list(
-                "Risks and blockers", summary.get("risks_or_blockers")
+                "Risks and blockers", payload.get("risks_or_blockers")
             )
         )
         parts.append(
-            self._render_html_list("Suggested follow-ups", summary.get("follow_ups"))
+            self._render_html_list("Suggested follow-ups", payload.get("follow_ups"))
         )
 
         model = summary.get("model")
@@ -392,12 +612,12 @@ class MeetingDetailsScreen(QWidget):
         )
 
     def _render_transcript(self, details: dict[str, Any]) -> None:
-        transcript = details.get("transcript")
+        transcript = self._primary_transcript(details)
         if not transcript:
             self.transcript_browser.setHtml(
                 self._wrap_html(
-                    "<p class='muted'>No transcript is available yet. Process "
-                    "the meeting to create one locally.</p>"
+                    "<p class='muted'>No transcript is available yet. Queue "
+                    "transcription from the server to create one.</p>"
                 )
             )
             return
@@ -406,7 +626,17 @@ class MeetingDetailsScreen(QWidget):
         parts = ["<h2>Transcript</h2>"]
         language = transcript.get("language")
         if language:
-            parts.append(f"<p class='muted'>Detected language: {html.escape(str(language))}</p>")
+            parts.append(
+                f"<p class='muted'>Detected language: {html.escape(str(language))}"
+                f"  |  provider: {html.escape(str(transcript.get('provider', '')))}"
+                f"</p>"
+            )
+        if transcript.get("fallback_from"):
+            parts.append(
+                "<p class='muted'>Produced by the local Whisper fallback "
+                f"after {html.escape(str(transcript.get('fallback_from')))} "
+                "was unavailable.</p>"
+            )
         if segments:
             for segment in segments:
                 try:
@@ -449,110 +679,98 @@ class MeetingDetailsScreen(QWidget):
         self.actions_table.setVisible(has_items)
         self.no_actions_label.setVisible(not has_items)
 
+    def _render_attachments(self, details: dict[str, Any]) -> None:
+        attachments = self._attachments(details)
+        self.attachments_table.setRowCount(len(attachments))
+        for row, attachment in enumerate(attachments):
+            created = str(attachment.get("created_at", ""))[:16].replace("T", " ")
+            values = (
+                str(attachment.get("original_filename", "")),
+                str(attachment.get("mime_type", "")),
+                _format_size(attachment.get("size_bytes")),
+                created,
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                cell.setData(Qt.ItemDataRole.UserRole, str(attachment["id"]))
+                self.attachments_table.setItem(row, column, cell)
+        has_items = bool(attachments)
+        self.attachments_table.setVisible(has_items)
+        self.no_attachments_label.setVisible(not has_items)
+        self._update_attachment_actions()
+
+    # -- controls ----------------------------------------------------------
+
     def _update_controls(self) -> None:
         details = self._details
         if details is None:
             self.play_button.setEnabled(False)
             self.transcribe_button.setEnabled(False)
             self.analyse_button.setEnabled(False)
-            self.open_folder_button.setEnabled(False)
+            self.export_button.setEnabled(False)
+            self.open_attachment_button.setEnabled(False)
             return
 
-        recording = details.get("recording")
-        audio_name = recording.get("audio") if recording else None
-        file_exists = bool(
-            audio_name
-            and self._audio_file_exists(details, str(audio_name))
-        )
-        self.open_folder_button.setEnabled(self._meeting_folder_exists(details))
-
-        transcript = details.get("transcript") or {}
+        idle = not self._processing
+        audio = self._original_audio(details)
+        self._audio_file_id = str(audio["id"]) if audio else None
+        transcript = self._primary_transcript(details) or {}
         has_transcript = bool(str(transcript.get("text") or "").strip())
         has_summary = details.get("summary") is not None
-        idle = not self._processing
 
         self.play_button.setEnabled(
-            file_exists and idle and self._player is not None
+            audio is not None and idle and self._player is not None
         )
-
-        # Transcription needs the audio file.  When a transcript already
-        # exists the button becomes "Re-transcribe"; the confirmation dialog
-        # in _request_transcription warns about the replaced analysis.
         self.transcribe_button.setEnabled(
-            recording is not None and file_exists and idle
+            audio is not None and idle and self._can_process
         )
         self.transcribe_button.setText(
             "Re-transcribe" if has_transcript else "Transcribe recording"
         )
         self.transcribe_button.setToolTip(
             (
-                "Transcribe the recording again. This replaces the existing "
-                "transcript and deletes the saved analysis."
+                "Transcribe the recording again. The new transcript becomes "
+                "the primary; re-run analysis afterwards."
                 if has_transcript
                 else ""
             )
         )
-
-        # Analysis needs only the transcript text, so it stays available even
-        # when the recording file has been moved or deleted.
         self.analyse_button.setEnabled(
-            has_transcript and self._analysis_available and idle
+            has_transcript and idle and self._can_process
         )
         self.analyse_button.setText(
             "Re-run analysis" if has_summary else "Analyse transcript"
         )
         self.analyse_button.setToolTip(
-            "" if self._analysis_available else "No analysis backend is configured."
+            "" if self._can_process else "Only the meeting host can queue jobs."
         )
+        self.export_button.setEnabled(idle)
 
-        if recording and not file_exists and not self._processing:
-            self._show_notice(
-                "The local recording file is missing. You can still read any "
-                "saved transcript and analysis, but audio playback and "
-                "transcription are unavailable.",
-                error=True,
-            )
+    def _update_attachment_actions(self) -> None:
+        has_selection = self._selected_attachment() is not None
+        self.open_attachment_button.setEnabled(has_selection and not self._processing)
 
-    def _audio_file_exists(self, details: dict[str, Any], audio_name: str) -> bool:
-        try:
-            return self.library.resolve_meeting_file(
-                str(details["id"]), audio_name
-            ).is_file()
-        except (LookupError, ValueError):
-            return False
+    def _selected_attachment(self) -> dict[str, Any] | None:
+        row = self.attachments_table.currentRow()
+        if row < 0:
+            return None
+        item = self.attachments_table.item(row, 0)
+        if item is None:
+            return None
+        file_id = item.data(Qt.ItemDataRole.UserRole)
+        for attachment in self._attachments(self._details or {}):
+            if str(attachment["id"]) == str(file_id):
+                return attachment
+        return None
 
-    def _meeting_folder_exists(self, details: dict[str, Any]) -> bool:
-        folder = details.get("meeting_dir")
-        return bool(folder) and Path(str(folder)).is_dir()
-
-    def _open_meeting_folder(self) -> None:
-        if self._details is None:
+    def _open_selected_attachment(self) -> None:
+        attachment = self._selected_attachment()
+        if attachment is None or self._download_worker is not None:
             return
-        folder = self._details.get("meeting_dir")
-        if not folder:
-            return
-        path = Path(str(folder))
-        if not path.is_dir():
-            self._show_notice("The meeting folder could not be found.", error=True)
-            self.open_folder_button.setEnabled(False)
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        self._start_download(attachment, open_after=True)
 
-    def set_library(self, library: MeetingLibrary) -> None:
-        """Point the screen at a different library and clear the open meeting."""
-
-        if self._player is not None:
-            self._player.stop()
-        self.library = library
-        self._meeting_id = None
-        self._details = None
-        self._processing = False
-        self.cancel_button.setVisible(False)
-        self.status_label.setText("")
-        self._render_empty_state("Select a meeting to view its details.")
-        self.open_folder_button.setEnabled(False)
-
-    # -- playback ------------------------------------------------------
+    # -- playback ----------------------------------------------------------
 
     def _toggle_playback(self) -> None:
         if self._player is None or self._details is None:
@@ -560,21 +778,60 @@ class MeetingDetailsScreen(QWidget):
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.stop()
             return
+        audio = self._original_audio(self._details)
+        if audio is None or self._audio_file_id is None:
+            return
+        cached = self._cached_audio_path(audio)
+        if cached is not None and cached.is_file():
+            self._play_file(cached)
+            return
+        self._start_download(audio, open_after=False)
 
-        recording = self._details.get("recording") or {}
-        audio_name = recording.get("audio")
-        if not audio_name:
+    def _cached_audio_path(self, audio: dict[str, Any]) -> Path | None:
+        sha = str(audio.get("sha256", ""))
+        filename = audio.get("original_filename") or "audio.wav"
+        if not sha:
+            return None
+        return self._cache_dir() / f"{sha[:16]}-{filename}"
+
+    def _cache_dir(self) -> Path:
+        return self.settings.data_dir / "audio-cache"
+
+    def _start_download(self, file_row: dict[str, Any], *, open_after: bool) -> None:
+        self._download_worker = _DownloadWorker(
+            self.client, file_row, self._cache_dir()
+        )
+        self._download_worker.completed.connect(
+            lambda row, path, error, open_after=open_after:
+            self._on_download_done(row, path, error, open_after)
+        )
+        self._download_worker.finished.connect(self._download_worker.deleteLater)
+        self.play_button.setEnabled(False)
+        self.open_attachment_button.setEnabled(False)
+        self.status_label.setText(
+            f"Downloading {file_row.get('original_filename') or 'file'}..."
+        )
+        self._download_worker.start()
+
+    def _on_download_done(
+        self, file_row: object, path: object, error: object, open_after: bool
+    ) -> None:
+        self._download_worker = None
+        self._update_controls()
+        self._update_attachment_actions()
+        if error:
+            self.status_label.setText("")
+            self._show_notice(f"Download failed: {error}", error=True)
             return
-        try:
-            path: Path = self.library.resolve_meeting_file(
-                str(self._details["id"]), str(audio_name)
-            )
-        except (LookupError, ValueError):
-            self._show_notice("The recording path is invalid.", error=True)
-            return
-        if not path.is_file():
-            self._show_notice("The recording file could not be found.", error=True)
-            self._update_controls()
+        assert path is not None
+        self.status_label.setText("")
+        if open_after:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            self._play_file(Path(str(path)))
+
+    def _play_file(self, path: Path) -> None:
+        if self._player is None:
             return
         self._player.setSource(QUrl.fromLocalFile(str(path)))
         self._player.play()
@@ -593,78 +850,158 @@ class MeetingDetailsScreen(QWidget):
                 f"Audio playback failed: {self._player.errorString()}", error=True
             )
 
-    # -- processing ----------------------------------------------------
+    # -- processing (server jobs) -------------------------------------------
 
     def _request_transcription(self) -> None:
         if self._meeting_id is None or self._processing:
             return
-        transcript = (self._details or {}).get("transcript") or {}
+        transcript = self._primary_transcript(self._details or {}) or {}
         has_transcript = bool(str(transcript.get("text") or "").strip())
         if has_transcript:
             answer = QMessageBox.question(
                 self,
                 "Re-transcribe meeting",
-                "Re-transcribing will replace the existing transcript and "
-                "delete the saved analysis for this meeting.\n\nContinue?",
+                "Transcribe the recording again on the server?\n\nThe new "
+                "transcript becomes the primary version and analysis will need "
+                "to be re-run.\n\nThe audio is sent to Sarvam (cloud).",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        self.transcribe_requested.emit(self._meeting_id)
+        self._run_action("transcribe", meeting_id=self._meeting_id)
 
     def _request_analysis(self) -> None:
         if self._meeting_id is None or self._processing:
             return
-        self.analysis_requested.emit(self._meeting_id)
+        self._run_action("analyse", meeting_id=self._meeting_id)
 
     def _request_cancel(self) -> None:
-        if self._processing:
-            self.cancel_requested.emit()
+        if not self._processing or self._details is None:
+            return
+        job_id = self._active_job_id
+        if not job_id:
+            jobs = self._details.get("jobs") or []
+            active = [j for j in jobs if j.get("status") in ("queued", "running")]
+            if not active:
+                return
+            job_id = str(active[0]["id"])
+        self._run_action(
+            "cancel", meeting_id=self._meeting_id, job_id=job_id
+        )
 
-    def set_processing(self, active: bool, message: str = "") -> None:
-        self._processing = active
-        self.back_button.setEnabled(not active)
-        self.cancel_button.setVisible(active)
+    def _run_action(self, action: str, **kwargs: Any) -> None:
+        if worker_running(self._action_worker):
+            return
+        self._action_worker = _JobActionWorker(self.client, action, **kwargs)
+        self._action_worker.completed.connect(
+            lambda result, error, action=action: self._on_action_done(
+                action, error, result
+            )
+        )
+        self._action_worker.finished.connect(self._action_worker.deleteLater)
+        self._set_busy(True, "Queuing on the server...")
+        self._action_worker.start()
+
+    def _on_action_done(self, action: str, error: object, result: object = None) -> None:
+        self._action_worker = None
+        if error:
+            self._set_busy(False)
+            self._show_notice(str(error), error=True)
+            return
+        if action == "cancel":
+            self._active_job_id = None
+            self._set_busy(False)
+            self.status_label.setText("Cancellation requested.")
+            self._poll_timer.stop()
+            self.reload()
+            return
+        if isinstance(result, dict) and result.get("id"):
+            self._active_job_id = str(result["id"])
+        self._processing = True
+        self._poll_timer.start()
+
+    def _poll_jobs(self) -> None:
+        if self._meeting_id is None:
+            return
+        if worker_running(self._poll_worker):
+            return
+        self._poll_worker = _JobPollWorker(self.client, self._meeting_id)
+        self._poll_worker.completed.connect(self._on_jobs_polled)
+        self._poll_worker.finished.connect(self._poll_worker.deleteLater)
+        self._poll_worker.start()
+
+    def _on_jobs_polled(self, jobs: list, error: object) -> None:
+        self._poll_worker = None
+        if error:
+            return  # transient polling errors are ignored; next tick retries
+        active = [j for j in jobs if j.get("status") in ("queued", "running")]
+        if self._details is not None:
+            self._details["jobs"] = jobs
         if active:
+            job = active[0]
+            self.status_label.setText(
+                f"{job.get('job_type', 'job').title()} {job.get('status', '')} "
+                f"({int(float(job.get('progress', 0)) * 100)}%) - "
+                f"{job.get('message') or 'working...'}"
+            )
+            return
+        self._poll_timer.stop()
+        self._active_job_id = None
+        self._set_busy(False)
+        self.status_label.setText("Processing complete.")
+        self.meeting_updated.emit()
+        self.reload()
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        self._processing = busy
+        self.back_button.setEnabled(not busy)
+        self.cancel_button.setVisible(busy)
+        if not busy:
+            self._poll_timer.stop()
+        if busy:
             self.transcribe_button.setEnabled(False)
             self.analyse_button.setEnabled(False)
-            self.tabs.setEnabled(False)
             self.play_button.setEnabled(False)
+            self.export_button.setEnabled(False)
+            self.open_attachment_button.setEnabled(False)
             if self._player is not None:
                 self._player.stop()
-            self.status_label.setText(message or "Processing meeting locally...")
+            self.status_label.setText(message or "Working...")
             self._show_notice("")
         else:
-            self.tabs.setEnabled(True)
             self._update_controls()
+            self._update_attachment_actions()
 
-    def processing_finished(self) -> None:
-        self._processing = False
-        self.cancel_button.setVisible(False)
-        self.tabs.setEnabled(True)
-        self.back_button.setEnabled(True)
-        self.status_label.setText("Meeting processing complete.")
-        self.reload()
+    def _export_meeting(self) -> None:
+        if self._meeting_id is None:
+            return
+        target, _ = self._ask_save_path()
+        if target is None:
+            return
+        self._set_busy(True, "Exporting meeting ZIP...")
+        worker = _ExportWorker(self.client, self._meeting_id, target)
+        worker.completed.connect(self._on_export_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        self._export_worker = worker
 
-    def processing_failed(self, message: str) -> None:
-        self._processing = False
-        self.cancel_button.setVisible(False)
-        self.tabs.setEnabled(True)
-        self.back_button.setEnabled(True)
-        self.status_label.setText("Processing failed.")
-        self.reload()
-        self._show_notice(message or "Meeting processing failed.", error=True)
+    def _ask_save_path(self) -> tuple[Path | None, Any]:
+        from PySide6.QtWidgets import QFileDialog
 
-    def processing_cancelled(self) -> None:
-        """Return the screen to an idle state after a user cancellation."""
+        default_name = f"meeting-{self._meeting_id}.zip"
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self, "Export meeting", default_name, "ZIP archive (*.zip)"
+        )
+        return (Path(chosen) if chosen else None), None
 
-        self._processing = False
-        self.cancel_button.setVisible(False)
-        self.tabs.setEnabled(True)
-        self.back_button.setEnabled(True)
-        self.status_label.setText("Processing cancelled.")
-        self.reload()
+    def _on_export_done(self, target: object, error: object) -> None:
+        self._set_busy(False)
+        if error:
+            self._show_notice(f"Export failed: {error}", error=True)
+            return
+        self.status_label.setText(f"Export saved: {target}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(str(target)).parent)))
 
     def _show_notice(self, message: str, *, error: bool = False) -> None:
         self.notice_label.setText(message)
@@ -673,14 +1010,15 @@ class MeetingDetailsScreen(QWidget):
         self.notice_label.style().polish(self.notice_label)
         self.notice_label.setVisible(bool(message))
 
-    # -- navigation / cleanup -----------------------------------------
+    # -- navigation / cleanup ----------------------------------------------
 
     def _go_back(self) -> None:
         if self._processing:
             QMessageBox.information(
                 self,
                 "Processing in progress",
-                "Please wait for local processing to finish before leaving.",
+                "A server job is still running. Cancel it or wait for it to "
+                "finish before leaving.",
             )
             return
         if self._player is not None:
@@ -698,13 +1036,52 @@ class MeetingDetailsScreen(QWidget):
         self.no_actions_label.setVisible(True)
         self.no_actions_label.setText(message)
 
-    def shutdown(self) -> None:
+    def clear_meeting(self) -> None:
         if self._player is not None:
             self._player.stop()
+        self._meeting_id = None
+        self._details = None
+        self._processing = False
+        self.cancel_button.setVisible(False)
+        self.status_label.setText("")
+        self._poll_timer.stop()
+        self._render_empty_state("Select a meeting to view its details.")
+        self._update_controls()
 
-    def set_user(self, user: dict[str, Any]) -> None:
-        self.current_user = user
-        if hasattr(self, 'user_label'):
-            self.user_label.setText(
-                f"Local profile: {user.get('display_name', 'Unknown')}"
-            )
+    def shutdown(self) -> None:
+        self._poll_timer.stop()
+        if self._player is not None:
+            self._player.stop()
+        for worker in (
+            self._details_worker,
+            self._download_worker,
+            self._action_worker,
+            self._poll_worker,
+            getattr(self, "_export_worker", None),
+        ):
+            if worker_running(worker):
+                worker.wait(5000)
+
+
+class _ExportWorker(QThread):
+    """Download the meeting export ZIP off the UI thread."""
+
+    completed = Signal(object, object)  # target path, error or None
+
+    def __init__(
+        self, client: TeamMeetingAIClient, meeting_id: str, target: Path
+    ) -> None:
+        super().__init__()
+        self.client = client
+        self.meeting_id = meeting_id
+        self.target = target
+
+    def run(self) -> None:
+        try:
+            self.client.export_meeting(self.meeting_id, self.target)
+        except (ApiClientError, ApiConnectionError) as exc:
+            self.completed.emit(None, str(exc))
+        except Exception as exc:
+            self.completed.emit(None, f"Unexpected error: {type(exc).__name__}: {exc}")
+        else:
+            self.completed.emit(self.target, None)

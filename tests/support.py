@@ -1,15 +1,42 @@
-"""Shared test helpers: synthetic WAVs and fake AI providers."""
+"""Shared test helpers: synthetic WAVs, fake AI providers, and UI pump."""
 
 from __future__ import annotations
 
 import threading
+import time
 import wave
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from ai.transcription import TranscriptionCancelled, TranscriptionResult
+
+
+def wait_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.02,
+) -> bool:
+    """Pump the Qt event loop until ``predicate`` is true (UI worker joins).
+
+    QThread workers deliver their ``completed`` signals through queued
+    connections, so tests must let the event loop run between thread
+    completion and slot execution.  Returns False on timeout.
+    """
+
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if app is not None:
+            app.processEvents()
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
 
 
 def write_pcm_wav(

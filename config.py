@@ -145,9 +145,18 @@ class Settings:
     whisper_model_size: str = "small"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
-    whisper_beam_size: int = 5
-    # Blank means auto-detect the spoken language.
+    # 1 selects greedy decoding, which is the fastest option and the default
+    # here.  Higher values switch to beam search (slower, marginally better).
+    whisper_beam_size: int = 1
+    # Blank means auto-detect the spoken language.  Pinning it (for example
+    # "hi" for Hindi) is the most effective guardrail against gibberish.
     whisper_language: str = ""
+    # Optional prompt that biases vocabulary and script (for example a short
+    # Hindi sentence to keep the output in Devanagari).
+    whisper_initial_prompt: str = ""
+    # Silence longer than this is skipped by voice-activity detection, which
+    # stops the model inventing sentences in quiet passages.
+    whisper_vad_min_silence_ms: int = 500
     # 0 means use the Faster-Whisper / ctranslate2 default.
     whisper_cpu_threads: int = 0
 
@@ -214,7 +223,9 @@ def load_settings() -> Settings:
         TEAMMEETINGAI_WHISPER_DEVICE
         TEAMMEETINGAI_WHISPER_COMPUTE_TYPE
         TEAMMEETINGAI_WHISPER_LANGUAGE
+        TEAMMEETINGAI_WHISPER_INITIAL_PROMPT
         TEAMMEETINGAI_WHISPER_BEAM_SIZE
+        TEAMMEETINGAI_WHISPER_VAD_MIN_SILENCE_MS
         TEAMMEETINGAI_WHISPER_CPU_THREADS
         TEAMMEETINGAI_ANALYSIS_BACKEND      ("none" | "groq")
         TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS  ("1" to opt in to cloud analysis)
@@ -241,8 +252,14 @@ def load_settings() -> Settings:
         whisper_compute_type=os.environ.get(
             "TEAMMEETINGAI_WHISPER_COMPUTE_TYPE", "int8"
         ),
-        whisper_beam_size=_int_env("TEAMMEETINGAI_WHISPER_BEAM_SIZE", 5),
+        whisper_beam_size=_int_env("TEAMMEETINGAI_WHISPER_BEAM_SIZE", 1),
         whisper_language=os.environ.get("TEAMMEETINGAI_WHISPER_LANGUAGE", ""),
+        whisper_initial_prompt=os.environ.get(
+            "TEAMMEETINGAI_WHISPER_INITIAL_PROMPT", ""
+        ),
+        whisper_vad_min_silence_ms=_int_env(
+            "TEAMMEETINGAI_WHISPER_VAD_MIN_SILENCE_MS", 500
+        ),
         whisper_cpu_threads=_int_env("TEAMMEETINGAI_WHISPER_CPU_THREADS", 0),
         analysis_backend=os.environ.get("TEAMMEETINGAI_ANALYSIS_BACKEND", "none"),
         allow_cloud_analysis=_bool_env("TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS"),

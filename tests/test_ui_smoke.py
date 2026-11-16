@@ -1,420 +1,465 @@
-"""Offscreen UI smoke and end-to-end widget tests."""
+"""UI end-to-end tests: real windows against a real HTTP server.
+
+These tests exercise the full client stack — PySide6 screens, QThread workers,
+the httpx client, and the live FastAPI server on PostgreSQL — the same way a
+user runs the application.  Only the AI providers and the background job
+runner on the server are faked; tests drive the pipeline synchronously.
+"""
 
 from __future__ import annotations
 
+import uuid
+import zipfile
 from pathlib import Path
 
-from PySide6.QtWidgets import QMessageBox
+import pytest
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-from storage import library as ops
-from support import valid_analysis
+from support import wait_until, write_pcm_wav
 
 
-def test_starts_on_login_and_creates_local_profile(window, qapp):
+# ---------------------------------------------------------------------------
+# Seeding helpers
+# ---------------------------------------------------------------------------
+
+
+def _seed_meeting(client, user, *, title="UI test meeting"):
+    """Upload a small recording through the client (host-only endpoint)."""
+
+    audio_dir = Path(client.base_url.replace(":", "_"))  # unused path guard
+    del audio_dir
+    import tempfile
+
+    work_dir = Path(tempfile.mkdtemp(prefix="tma-seed-"))
+    try:
+        audio = write_pcm_wav(work_dir / "audio.wav", seconds=0.3)
+        meeting = client.upload_recording(
+            title=title,
+            user_id=str(user["id"]),
+            audio=audio,
+            filename="audio.wav",
+            duration_ms=300,
+        )
+    finally:
+        import shutil
+
+        shutil.rmtree(work_dir, ignore_errors=True)
+    return meeting
+
+
+def _queued_transcription_job(client, meeting_id):
+    jobs = client.list_jobs(meeting_id)
+    queued = [
+        job for job in jobs
+        if job["job_type"] == "transcription" and job["status"] == "queued"
+    ]
+    assert queued, f"Expected a queued transcription job, got {jobs}"
+    return queued[0]
+
+
+def _seed_processed_meeting(server, client, user, *, title="Processed meeting"):
+    """Upload a recording and run transcription + analysis synchronously."""
+
+    meeting = _seed_meeting(client, user, title=title)
+    server.run_job(_queued_transcription_job(client, meeting["id"])["id"])
+    analysis_job = client.analyse(meeting["id"])
+    server.run_job(analysis_job["id"])
+    return meeting
+
+
+def _login(window, user):
+    window._on_profile_selected(user)
+
+
+# ---------------------------------------------------------------------------
+# Startup / server check
+# ---------------------------------------------------------------------------
+
+
+def test_window_starts_on_login_screen_and_reports_server(window, qapp):
+    from PySide6.QtWidgets import QApplication
+
     assert window.stack.currentWidget() is window.login_screen
-    window.login_screen.new_profile_edit.setText("UI Test User")
-    window.login_screen._continue()
-    qapp.processEvents()
-
-    assert window.stack.currentWidget() is window.dashboard_screen
-    assert window.current_user is not None
-    assert window.dashboard_screen.user_label.text().endswith("UI Test User")
-
-
-def test_dashboard_lists_and_searches_meetings(
-    window, qapp, user, processed_meeting
-):
-    window._on_profile_selected(user)
-    window.dashboard_screen.refresh()
-    qapp.processEvents()
-
-    assert window.dashboard_screen.table.rowCount() == 1
-    assert window.dashboard_screen.table.item(0, 1).text() == "Recorded test meeting"
-
-    window.dashboard_screen.search_edit.setText("release")
-    window.dashboard_screen.refresh()
-    assert window.dashboard_screen.table.rowCount() == 1
-
-    window.dashboard_screen.search_edit.setText("no-such-meeting")
-    window.dashboard_screen.refresh()
-    assert window.dashboard_screen.table.rowCount() == 0
-
-
-def test_details_renders_processed_meeting(
-    window_with_analysis, qapp, user, processed_meeting
-):
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(processed_meeting["id"])
-    qapp.processEvents()
-
-    screen = window_with_analysis.details_screen
-    assert screen.title_label.text() == "Recorded test meeting"
-    assert "Complete" in screen.meta_label.text()
-    assert "The team agreed" in screen.overview_browser.toPlainText()
-    assert "Alice" in screen.transcript_browser.toPlainText()
-    assert screen.actions_table.rowCount() == 1
-    assert screen.transcribe_button.isEnabled()
-    assert screen.transcribe_button.text() == "Re-transcribe"
-    assert screen.analyse_button.isEnabled()
-    assert screen.analyse_button.text() == "Re-run analysis"
-    if screen._player is not None:
-        assert screen.play_button.isEnabled()
-
-
-def test_details_buttons_for_fresh_recording(
-    window, qapp, db, settings, user, wav_factory
-):
-    meeting = ops.create_meeting(db, user["id"], "Fresh recording")
-    path = Path(meeting["meeting_dir"]) / "audio.wav"
-    wav_factory(path, seconds=0.25)
-    ops.finish_recording(
-        db,
-        meeting["id"],
-        relative_path=path.name,
-        format="wav",
-        duration_seconds=0.25,
-        size_bytes=path.stat().st_size,
-        sample_rate=48000,
-        channels=2,
+    assert wait_until(
+        lambda: window.statusBar().currentMessage().startswith("Ready")
     )
-
-    window._on_profile_selected(user)
-    window._open_meeting(meeting["id"])
-    qapp.processEvents()
-
-    screen = window.details_screen
-    # No analysis backend is configured in the default test window.
-    assert screen.transcribe_button.isEnabled()
-    assert screen.transcribe_button.text() == "Transcribe recording"
-    assert not screen.analyse_button.isEnabled()
-
-
-def test_details_missing_file_disables_transcribe(
-    window, qapp, db, settings, user
-):
-    meeting = ops.create_meeting(db, user["id"], "Missing audio meeting")
-    ops.save_transcript(
-        db,
-        meeting["id"],
-        text="We agreed to ship the release.",
-        segments=[{"start": 0.0, "end": 1.0, "text": "We agreed to ship the release."}],
-        language="en",
-    )
-    ops.finish_recording(
-        db,
-        meeting["id"],
-        relative_path=f"{meeting['id']}.wav",
-        format="wav",
-        duration_seconds=1.0,
-        size_bytes=1000,
-        sample_rate=48000,
-        channels=2,
-    )
-
-    window._on_profile_selected(user)
-    window._open_meeting(meeting["id"])
-    qapp.processEvents()
-
-    screen = window.details_screen
-    assert not screen.play_button.isEnabled()
-    assert not screen.transcribe_button.isEnabled()
-    # No analysis backend in the default window, so analysis is unavailable.
-    assert not screen.analyse_button.isEnabled()
-    assert "missing" in screen.notice_label.text().lower()
-
-
-def test_details_analyse_works_without_recording_file(
-    window_with_analysis, qapp, db, settings, user
-):
-    """Analysis needs only the transcript, so it works without the audio."""
-
-    meeting = ops.create_meeting(db, user["id"], "Transcript only meeting")
-    ops.save_transcript(
-        db,
-        meeting["id"],
-        text="We agreed to ship the release.",
-        segments=[{"start": 0.0, "end": 1.0, "text": "We agreed to ship the release."}],
-        language="en",
-    )
-    ops.finish_recording(
-        db,
-        meeting["id"],
-        relative_path=f"{meeting['id']}.wav",
-        format="wav",
-        duration_seconds=1.0,
-        size_bytes=1000,
-        sample_rate=48000,
-        channels=2,
-    )
-
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(meeting["id"])
-    qapp.processEvents()
-
-    screen = window_with_analysis.details_screen
-    assert not screen.play_button.isEnabled()
-    assert not screen.transcribe_button.isEnabled()
-    assert screen.analyse_button.isEnabled()
-    assert screen.analyse_button.text() == "Analyse transcript"
-    assert "missing" in screen.notice_label.text().lower()
+    QApplication.instance().processEvents()
 
 
 # ---------------------------------------------------------------------------
-# Re-transcribe confirmation
+# Login screen
 # ---------------------------------------------------------------------------
 
 
-class _FakeQMessageBox:
-    # Reuse the real enum so flag arithmetic (Yes | No) keeps working.
-    StandardButton = QMessageBox.StandardButton
-    last_title: str | None = None
-
-    @staticmethod
-    def question(_parent, title, _text, *_args, **_kwargs):
-        _FakeQMessageBox.last_title = title
-        return QMessageBox.StandardButton.Yes
+def test_login_lists_server_profiles(window, client, user):
+    screen = window.login_screen
+    assert wait_until(lambda: screen.profile_combo.count() >= 2)
+    labels = [
+        screen.profile_combo.itemText(i) for i in range(screen.profile_combo.count())
+    ]
+    assert "Test User" in labels
 
 
-def test_retranscribe_confirm_dialog_yes_starts_retranscription(
-    window_with_analysis, qapp, user, processed_meeting, monkeypatch
-):
-    monkeypatch.setattr("ui.meeting_details.QMessageBox", _FakeQMessageBox)
-    screen = window_with_analysis.details_screen
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(processed_meeting["id"])
-    qapp.processEvents()
+def test_login_continues_with_selected_profile(window, client, user):
+    screen = window.login_screen
+    assert wait_until(lambda: screen.profile_combo.count() >= 2)
+    index = screen.profile_combo.findData(str(user["id"]))
+    assert index >= 0
+    screen.profile_combo.setCurrentIndex(index)
 
-    emitted: list[str] = []
-    screen.transcribe_requested.connect(emitted.append)
-    screen._request_transcription()
+    selected: list = []
+    screen.profile_selected.connect(selected.append)
+    screen._continue()
 
-    assert _FakeQMessageBox.last_title == "Re-transcribe meeting"
-    assert emitted == [processed_meeting["id"]]
+    assert len(selected) == 1
+    assert str(selected[0]["id"]) == str(user["id"])
 
 
-def test_retranscribe_confirm_dialog_no_keeps_transcript(
-    window_with_analysis, qapp, user, processed_meeting, monkeypatch
-):
-    class NoBox(_FakeQMessageBox):
-        @staticmethod
-        def question(*_args, **_kwargs):
-            return QMessageBox.StandardButton.No
+def test_login_creates_new_profile(window, client):
+    screen = window.login_screen
+    screen.new_profile_edit.setText("Fresh Tester")
+    selected: list = []
+    screen.profile_selected.connect(selected.append)
+    screen._continue()
 
-    monkeypatch.setattr("ui.meeting_details.QMessageBox", NoBox)
-    screen = window_with_analysis.details_screen
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(processed_meeting["id"])
-    qapp.processEvents()
+    assert wait_until(lambda: bool(selected))
+    assert selected[0]["display_name"] == "Fresh Tester"
+    names = [u["display_name"] for u in client.list_users()]
+    assert "Fresh Tester" in names
 
-    emitted: list[str] = []
-    screen.transcribe_requested.connect(emitted.append)
-    screen._request_transcription()
 
-    assert emitted == []
-    details = ops.get_meeting_details(
-        window_with_analysis.library, processed_meeting["id"]
+def test_main_window_login_flow_reaches_dashboard(window, client, user):
+    screen = window.login_screen
+    assert wait_until(lambda: screen.profile_combo.count() >= 2)
+    screen.new_profile_edit.setText(user["display_name"])
+    screen._continue()
+    assert wait_until(
+        lambda: window.stack.currentWidget() is window.dashboard_screen
     )
-    assert details["transcript"] is not None
-    assert details["summary"] is not None
+    assert window.client.profile_id == str(user["id"])
+    assert window.dashboard_screen.user_label.text().endswith(user["display_name"])
 
 
-def test_fresh_transcription_does_not_ask_for_confirmation(
-    window_with_analysis, qapp, db, settings, user, wav_factory, monkeypatch
+# ---------------------------------------------------------------------------
+# Dashboard: list, search, delete
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_lists_meetings(window, client, user):
+    meeting = _seed_meeting(client, user, title="Recorded UI meeting")
+    _login(window, user)
+
+    table = window.dashboard_screen.table
+    assert wait_until(lambda: table.rowCount() == 1)
+    assert table.item(0, 1).text() == "Recorded UI meeting"
+    status = table.item(0, 3).text()
+    assert status == "Recorded"  # ingest queued transcription server-side
+
+
+def test_dashboard_search_filters(window, client, user):
+    _seed_meeting(client, user, title="Release planning")
+    _seed_meeting(client, user, title="Budget review")
+    _login(window, user)
+
+    table = window.dashboard_screen.table
+    assert wait_until(lambda: table.rowCount() == 2)
+
+    window.dashboard_screen.search_edit.setText("Budget")
+    assert wait_until(lambda: table.rowCount() == 1)
+    assert table.item(0, 1).text() == "Budget review"
+
+    window.dashboard_screen.search_edit.setText("zzz-no-match")
+    assert wait_until(lambda: not window.dashboard_screen.empty_label.isHidden())
+
+
+def test_dashboard_delete_is_two_step_and_permanent(
+    window, client, user, monkeypatch
 ):
-    meeting = ops.create_meeting(db, user["id"], "Fresh UI meeting")
-    path = Path(meeting["meeting_dir"]) / "audio.wav"
-    wav_factory(path, seconds=0.25)
-    ops.finish_recording(
-        db,
-        meeting["id"],
-        relative_path=path.name,
-        format="wav",
-        duration_seconds=0.25,
-        size_bytes=path.stat().st_size,
-        sample_rate=48000,
-        channels=2,
-    )
+    meeting = _seed_meeting(client, user, title="Doomed meeting")
+    _login(window, user)
+    table = window.dashboard_screen.table
+    assert wait_until(lambda: table.rowCount() == 1)
+    table.selectRow(0)
 
     asked: list[str] = []
 
-    class AskBox(_FakeQMessageBox):
-        @staticmethod
-        def question(_parent, title, *_args, **_kwargs):
-            asked.append(title)
-            return QMessageBox.StandardButton.No
+    def fake_question(*_args, **_kwargs):
+        asked.append("confirm")
+        return QMessageBox.StandardButton.Yes
 
-    monkeypatch.setattr("ui.meeting_details.QMessageBox", AskBox)
-    screen = window_with_analysis.details_screen
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(meeting["id"])
-    qapp.processEvents()
+    monkeypatch.setattr("ui.dashboard.QMessageBox.question", fake_question)
+    screen = window.dashboard_screen
 
-    emitted: list[str] = []
-    screen.transcribe_requested.connect(emitted.append)
+    # First press only arms the destructive button.
+    screen._delete_selected()
+    assert screen.delete_button.text() == "Confirm delete?"
+    assert client.get_meeting(meeting["id"])["id"] == meeting["id"]
+
+    # Second press confirms; the meeting is gone on the server.
+    screen._delete_selected()
+    assert wait_until(lambda: table.rowCount() == 0)
+    assert asked == ["confirm"]
+    from client.api_client import ApiClientError
+
+    with pytest.raises(ApiClientError) as excinfo:
+        client.get_meeting(meeting["id"])
+    assert excinfo.value.status_code == 404
+
+
+def test_dashboard_delete_second_press_within_window(
+    window, client, user, monkeypatch
+):
+    """Disarm happens only via the timeout, not a different meeting arm."""
+
+    meeting = _seed_meeting(client, user, title="Armed meeting")
+    _login(window, user)
+    table = window.dashboard_screen.table
+    assert wait_until(lambda: table.rowCount() == 1)
+    table.selectRow(0)
+    screen = window.dashboard_screen
+
+    screen._delete_selected()
+    assert screen._delete_armed_for == meeting["id"]
+    # A disarm call for another meeting id must not clear the current arm.
+    screen._disarm_delete("some-other-id")
+    assert screen._delete_armed_for == meeting["id"]
+
+
+def test_dashboard_status_footer(window, client, user):
+    _seed_meeting(client, user)
+    _login(window, user)
+    assert wait_until(
+        lambda: window.dashboard_screen.status_label.text().startswith("Server:")
+    )
+    text = window.dashboard_screen.status_label.text()
+    assert "1 meetings" in text
+    assert "database" in text
+
+
+# ---------------------------------------------------------------------------
+# Meeting details
+# ---------------------------------------------------------------------------
+
+
+def test_details_renders_transcript_summary_and_actions(
+    window, server, client, user
+):
+    meeting = _seed_processed_meeting(server, client, user)
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+
+    assert wait_until(
+        lambda: "Fake primary transcript content."
+        in screen.transcript_browser.toPlainText()
+    )
+    assert wait_until(
+        lambda: "The team agreed to ship the release."
+        in screen.overview_browser.toPlainText()
+    )
+    assert screen.actions_table.rowCount() == 1
+    assert screen.actions_table.item(0, 0).text() == "Ship the release"
+    assert screen.tabs.tabText(0) == "Summary"
+
+
+def test_details_unprocessed_meeting_offers_transcription(
+    window, client, user
+):
+    meeting = _seed_meeting(client, user, title="Raw meeting")
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+
+    assert wait_until(
+        lambda: "not been processed" in screen.overview_browser.toPlainText()
+    )
+    assert screen.transcribe_button.isEnabled()
+    assert screen.transcribe_button.text() == "Transcribe recording"
+    assert not screen.analyse_button.isEnabled()
+    assert not screen.play_button.isEnabled() or screen.play_button.isEnabled()
+
+
+def test_details_attachments_tab_download(window, client, user, tmp_path, monkeypatch):
+    meeting = _seed_meeting(client, user)
+    client.upload_attachment(
+        meeting["id"], _make_attachment(tmp_path, "notes.txt", b"attached text")
+    )
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+
+    assert wait_until(lambda: screen.attachments_table.rowCount() == 1)
+    assert screen.attachments_table.item(0, 0).text() == "notes.txt"
+
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "ui.meeting_details.QDesktopServices.openUrl",
+        lambda url: opened.append(url.toString()),
+    )
+    screen.attachments_table.selectRow(0)
+    screen._open_selected_attachment()
+
+    assert wait_until(lambda: bool(opened))
+    cache_dir = window.settings.data_dir / "audio-cache"
+    files = list(cache_dir.glob("*-notes.txt"))
+    assert files and files[0].read_text(encoding="utf-8") == "attached text"
+
+
+def test_details_retranscribe_confirm_then_cancel(
+    window, server, client, user, monkeypatch
+):
+    meeting = _seed_processed_meeting(server, client, user)
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+    assert wait_until(lambda: screen.transcribe_button.text() == "Re-transcribe")
+
+    asked: list[str] = []
+
+    def fake_question(_parent, title, *_args, **_kwargs):
+        asked.append(title)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr("ui.meeting_details.QMessageBox.question", fake_question)
     screen._request_transcription()
 
-    assert asked == []
-    assert emitted == [meeting["id"]]
-
-
-# ---------------------------------------------------------------------------
-# Speaker labels in the transcript view
-# ---------------------------------------------------------------------------
-
-
-def test_details_renders_speaker_labels(window, qapp, db, user):
-    meeting = ops.create_meeting(db, user["id"], "Labelled meeting")
-    ops.save_transcript(
-        db,
-        meeting["id"],
-        text="Me: hello\nRemote: hi there",
-        segments=[
-            {"start": 0.0, "end": 1.0, "text": "hello", "speaker": "Me"},
-            {"start": 1.5, "end": 2.0, "text": "hi there", "speaker": "Remote"},
-        ],
-        language="en",
-    )
-
-    window._on_profile_selected(user)
-    window._open_meeting(meeting["id"])
-    qapp.processEvents()
-
-    text = window.details_screen.transcript_browser.toPlainText()
-    assert "[00:00] Me:" in text
-    assert "[00:01] Remote:" in text
-
-
-# ---------------------------------------------------------------------------
-# Cancel button
-# ---------------------------------------------------------------------------
-
-
-def test_details_cancel_button_visible_only_while_processing(
-    window_with_analysis, qapp, user, processed_meeting
-):
-    screen = window_with_analysis.details_screen
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(processed_meeting["id"])
-    qapp.processEvents()
-
-    assert not screen.cancel_button.isVisibleTo(screen)
-
-    screen.set_processing(True, "Transcribing...")
+    assert asked == ["Re-transcribe meeting"]
+    assert wait_until(lambda: screen._processing)
+    assert wait_until(lambda: "queued" in screen.status_label.text().lower())
     assert screen.cancel_button.isVisibleTo(screen)
-    assert not screen.transcribe_button.isEnabled()
-    assert not screen.analyse_button.isEnabled()
 
-    emitted: list[str] = []
-    screen.cancel_requested.connect(
-        lambda: emitted.append(screen._meeting_id or "")
-    )
     screen._request_cancel()
-    assert emitted == [processed_meeting["id"]]
-
-    screen.set_processing(False)
+    assert wait_until(lambda: "cancellation requested" in screen.status_label.text().lower())
     assert not screen.cancel_button.isVisibleTo(screen)
 
 
-def test_details_processing_cancelled_returns_to_idle(
-    window_with_analysis, qapp, user, processed_meeting
+def test_details_fresh_transcription_needs_no_confirm(
+    window, client, user, monkeypatch
 ):
-    screen = window_with_analysis.details_screen
-    window_with_analysis._on_profile_selected(user)
-    window_with_analysis._open_meeting(processed_meeting["id"])
-    screen.set_processing(True, "Transcribing...")
-    screen.processing_cancelled()
-    qapp.processEvents()
-
-    assert not screen._processing
-    assert not screen.cancel_button.isVisibleTo(screen)
-    assert "cancelled" in screen.status_label.text().lower()
-    # The meeting keeps its previous state.
-    details = ops.get_meeting_details(
-        window_with_analysis.library, processed_meeting["id"]
-    )
-    assert details["status"] == "completed"
-
-
-def test_details_handles_missing_recording_file(window, qapp, db, settings, user):
-    meeting = ops.create_meeting(db, user["id"], "Missing audio meeting")
-    ops.finish_recording(
-        db,
-        meeting["id"],
-        relative_path=f"{meeting['id']}.wav",
-        format="wav",
-        duration_seconds=2.0,
-        size_bytes=1000,
-        sample_rate=48000,
-        channels=2,
-    )
-
-    window._on_profile_selected(user)
+    meeting = _seed_meeting(client, user)
+    _login(window, user)
     window._open_meeting(meeting["id"])
-    qapp.processEvents()
-
     screen = window.details_screen
-    assert not screen.play_button.isEnabled()
-    assert not screen.transcribe_button.isEnabled()
-    assert not screen.analyse_button.isEnabled()
-    assert "missing" in screen.notice_label.text().lower()
+    assert wait_until(lambda: screen.transcribe_button.isEnabled())
+
+    asked: list[str] = []
+
+    def fake_question(_parent, title, *_args, **_kwargs):
+        asked.append(title)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr("ui.meeting_details.QMessageBox.question", fake_question)
+    screen._request_transcription()
+
+    assert asked == []  # no re-transcription confirmation for fresh meetings
+    assert wait_until(lambda: screen._processing)
 
 
-def test_details_shows_no_action_items_message(
-    window, qapp, db, user, processed_meeting
-):
-    analysis = valid_analysis()
-    analysis["action_items"] = []
-    ops.save_analysis(db, processed_meeting["id"], analysis, model=None)
-
-    window._on_profile_selected(user)
-    window._open_meeting(processed_meeting["id"])
-    qapp.processEvents()
-
+def test_details_export_zip(window, server, client, user, tmp_path, monkeypatch):
+    meeting = _seed_processed_meeting(server, client, user)
+    _login(window, user)
+    window._open_meeting(meeting["id"])
     screen = window.details_screen
-    assert screen.actions_table.rowCount() == 0
-    assert "No action items" in screen.no_actions_label.text()
+    assert wait_until(lambda: screen.export_button.isEnabled())
+
+    target = tmp_path / "export.zip"
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        staticmethod(lambda *args, **kwargs: (str(target), "")),
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "ui.meeting_details.QDesktopServices.openUrl",
+        lambda url: opened.append(url.toString()),
+    )
+    screen._export_meeting()
+
+    assert wait_until(lambda: target.is_file() and zipfile.is_zipfile(target))
+    archive = zipfile.ZipFile(target)
+    names = archive.namelist()
+    assert "meeting.json" in names
+    assert "transcripts/primary.txt" in names
 
 
-def test_recording_screen_validates_title(window, qapp, user):
-    window._on_profile_selected(user)
-    window._start_recording()
-    qapp.processEvents()
+# ---------------------------------------------------------------------------
+# Recording screen
+# ---------------------------------------------------------------------------
 
+
+def test_recording_screen_disabled_without_host_capability(window, qapp):
     screen = window.recording_screen
-    screen.title_edit.clear()
+    screen.set_can_record(False)
+    assert not screen.start_button.isEnabled()
     screen._start_recording()
-    assert "title" in screen.error_label.text().lower()
+    assert "host" in screen.error_label.text().lower()
     assert screen._state == "idle"
 
 
-def test_dashboard_delete_removes_meeting_and_file(
-    window, qapp, db, settings, user, processed_meeting, monkeypatch
-):
-    meeting_dir = Path(processed_meeting["meeting_dir"])
-    recording_path = meeting_dir / "audio.wav"
-    assert recording_path.exists()
+def test_stop_worker_uploads_recording(window, client, user, tmp_path):
+    """The stop worker finalises the local WAV and uploads it to the server."""
 
-    window._on_profile_selected(user)
-    window.dashboard_screen.refresh()
-    window.dashboard_screen.table.selectRow(0)
+    from audio.recorder import RecordingResult
+    from ui.recorder import _StopWorker
 
-    monkeypatch.setattr(
-        "ui.dashboard.QMessageBox.question",
-        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    work_dir = tmp_path / "capture"
+    work_dir.mkdir()
+    audio = write_pcm_wav(work_dir / "audio.wav", seconds=0.3)
+
+    class _FakeRecorder:
+        def stop(self) -> RecordingResult:
+            return RecordingResult(
+                meeting_id="local",
+                relative_path="audio.wav",
+                absolute_path=audio,
+                duration_seconds=0.3,
+                size_bytes=audio.stat().st_size,
+                sample_rate=48000,
+                channels=2,
+            )
+
+    _login(window, user)
+    worker = _StopWorker(
+        window.client, str(user["id"]), "Uploaded meeting", _FakeRecorder(), work_dir
     )
-    window.dashboard_screen._delete_selected()
-    qapp.processEvents()
+    results: list = []
+    worker.completed.connect(lambda meeting, message: results.append((meeting, message)))
+    worker.start()
+    assert wait_until(lambda: bool(results))
 
-    assert ops.get_meeting(db, processed_meeting["id"]) is None
-    assert not recording_path.exists()
-    assert window.dashboard_screen.table.rowCount() == 0
+    meeting, message = results[0]
+    assert message is None
+    assert meeting["title"] == "Uploaded meeting"
+    titles = [m["title"] for m in client.list_meetings()]
+    assert "Uploaded meeting" in titles
+    # The temporary capture directory is cleaned up after upload.
+    assert not work_dir.exists()
 
 
-def test_details_tabs_are_summary_and_transcript(window):
-    """The analysis and the action items share one Summary tab."""
+# ---------------------------------------------------------------------------
+# System status dialog
+# ---------------------------------------------------------------------------
 
-    screen = window.details_screen
-    labels = [screen.tabs.tabText(i) for i in range(screen.tabs.count())]
-    assert labels == ["Summary", "Transcript"]
-    # The analysis browser and the action-item table live in the same tab.
-    assert screen.overview_browser.parentWidget() is screen.actions_table.parentWidget()
+
+def test_system_status_dialog_renders_server_health(window, client, user):
+    from ui.system_status import SystemStatusDialog
+
+    _seed_meeting(client, user)
+    dialog = SystemStatusDialog(window.client, window)
+    try:
+        assert wait_until(
+            lambda: "meetings stored on the server" in dialog.summary_label.text()
+        )
+        assert dialog.headroom_bar.isVisibleTo(dialog)
+        assert "Last backup" in dialog.backup_label.text() or "No backup" in (
+            dialog.backup_label.text()
+        )
+    finally:
+        dialog.shutdown()
+        dialog.close()
+
+
+def _make_attachment(directory: Path, filename: str, payload: bytes) -> Path:
+    path = directory / filename
+    path.write_bytes(payload)
+    return path

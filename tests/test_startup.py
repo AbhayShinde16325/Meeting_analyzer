@@ -1,8 +1,11 @@
-"""Startup-layer tests: env loading, stylesheet resolution, provider wiring,
-legacy migration, and logging configuration.
+"""Startup-layer tests: env loading, stylesheet resolution, logging, and the
+composition-root contract of ``main.py``.
 
-These cover the composition-root contract in ``main.py`` that the earlier
-regression silently dropped (audit items AUD-002/004/007/008/019).
+The application is now a thin desktop client (``client/api_client.py``) that
+talks to the FastAPI server.  The old in-process provider wiring and the
+SQLite-to-library migration hook no longer exist in ``main.py``; the
+replacement behaviour is covered by ``tests/test_api.py`` (server wiring) and
+``tests/test_ui_smoke.py`` (client composition).
 """
 
 from __future__ import annotations
@@ -14,19 +17,11 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-import dataclasses
 import pytest
 
 import main
-from ai.faster_whisper_provider import FasterWhisperProvider
-from ai.provider_factory import ProviderConfigurationError
-from main import (
-    _build_providers,
-    _configure_logging,
-    _load_local_env,
-    _load_stylesheet,
-    _migrate_legacy_if_present,
-)
+from client.api_client import DEFAULT_SERVER_URL, SERVER_URL_ENV, server_url_from_env
+from main import _apply_light_theme, _configure_logging, _load_local_env, _load_stylesheet
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,6 +78,14 @@ def test_importing_main_works_from_another_working_directory(tmp_path):
     assert "stylesheet-ok: True" in result.stdout
 
 
+def test_light_theme_installs_palette_and_stylesheet(qapp):
+    """The theme is applied application-wide so dialogs inherit it."""
+
+    _apply_light_theme(qapp)
+    assert qapp.styleSheet().strip(), "the application stylesheet should be set"
+    assert qapp.palette().window().color().name() == "#f8fafc"
+
+
 # ---------------------------------------------------------------------------
 # .env loading
 # ---------------------------------------------------------------------------
@@ -118,57 +121,26 @@ def test_load_local_env_missing_file_returns_false(tmp_path):
     assert _load_local_env(tmp_path / "no-such.env") is False
 
 
-# ---------------------------------------------------------------------------
-# Provider wiring
-# ---------------------------------------------------------------------------
+def test_load_local_env_feeds_the_server_url(tmp_path, monkeypatch):
+    """The .env file is the supported way to point the client at the host."""
 
-
-def test_build_providers_none_backend_returns_local_transcriber_only(settings):
-    transcription, analysis = _build_providers(settings)
-    assert isinstance(transcription, FasterWhisperProvider)
-    assert analysis is None
-
-
-def test_build_providers_groq_without_optin_raises(settings):
-    groq_settings = dataclasses.replace(
-        settings,
-        analysis_backend="groq",
-        allow_cloud_analysis=False,
-        groq_model="test-model",
+    monkeypatch.delenv(SERVER_URL_ENV, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f'{SERVER_URL_ENV}="http://192.168.1.20:8000"\n', encoding="utf-8"
     )
-    with pytest.raises(ProviderConfigurationError) as excinfo:
-        _build_providers(groq_settings)
-    assert "opt-in" in str(excinfo.value)
+    assert _load_local_env(env_file) is True
+    assert server_url_from_env() == "http://192.168.1.20:8000"
 
 
-def test_build_providers_unknown_backend_raises(settings):
-    broken = dataclasses.replace(settings, analysis_backend="carrier-pigeon")
-    with pytest.raises(ProviderConfigurationError):
-        _build_providers(broken)
+def test_server_url_defaults_to_localhost(monkeypatch):
+    monkeypatch.delenv(SERVER_URL_ENV, raising=False)
+    assert server_url_from_env() == DEFAULT_SERVER_URL == "http://localhost:8000"
 
 
-# ---------------------------------------------------------------------------
-# Legacy migration hook
-# ---------------------------------------------------------------------------
-
-
-def test_migrate_legacy_if_present_is_a_noop_without_legacy_db(settings, db):
-    result = _migrate_legacy_if_present(settings, db)
-    assert result is not None
-    assert result.migrated == 0
-    assert result.errors == []
-
-
-def test_migrate_legacy_if_present_survives_migration_errors(
-    settings, db, monkeypatch
-):
-    """A broken migration must never abort the application startup."""
-
-    def _boom(_settings, _library):
-        raise RuntimeError("simulated migration crash")
-
-    monkeypatch.setattr("main.migrate_legacy_sqlite", _boom)
-    assert _migrate_legacy_if_present(settings, db) is None
+def test_server_url_blank_value_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv(SERVER_URL_ENV, "   ")
+    assert server_url_from_env() == DEFAULT_SERVER_URL
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +175,35 @@ def test_configure_logging_is_idempotent(settings):
     for handler in handlers:
         root.removeHandler(handler)
         handler.close()
+
+
+# ---------------------------------------------------------------------------
+# Composition root
+# ---------------------------------------------------------------------------
+
+
+def test_main_module_no_longer_wires_local_providers():
+    """Providers live on the server; the client must not build them."""
+
+    for obsolete in (
+        "_build_providers",
+        "_migrate_legacy_if_present",
+        "MeetingProcessingWorker",
+    ):
+        assert not hasattr(main, obsolete), f"{obsolete} belongs to the old architecture"
+
+
+def test_composition_root_injects_an_http_client():
+    """MainWindow takes exactly an HTTP client and settings - no engine."""
+
+    import inspect
+
+    from client.api_client import TeamMeetingAIClient
+    from config import Settings
+
+    parameters = list(inspect.signature(main.MainWindow.__init__).parameters.values())
+    # ``from __future__ import annotations`` keeps these as strings.
+    names = [getattr(p.annotation, "__name__", p.annotation) for p in parameters[1:]]
+    assert names == [TeamMeetingAIClient.__name__, Settings.__name__]
+    assert not hasattr(main, "build_engine"), "the client owns no database engine"
+    assert not hasattr(main, "FasterWhisperProvider"), "providers live on the server"

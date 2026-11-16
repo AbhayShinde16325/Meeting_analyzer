@@ -1,12 +1,18 @@
-"""Manual meeting recording screen.
+"""Manual meeting recording screen (host machine only).
 
-Recording always requires an explicit Start action.  The screen shows a clear
-recording indicator and elapsed time, keeps the UI responsive while audio is
-captured, and only reports success after the recording has been finalised.
+Recording always requires an explicit Start action and a clear indicator.
+Audio is captured locally (microphone + system loopback), finalised into one
+WAV file, and then uploaded to the team server in a background thread.  After
+upload the server queues transcription: audio is sent to Sarvam's cloud
+service, which is disclosed in the consent label below.
 """
 
 from __future__ import annotations
 
+import shutil
+import tempfile
+import uuid
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -24,79 +30,90 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from pathlib import Path
-
 from audio.microphone import AudioDevice, AudioDeviceError, list_microphones
 from audio.recorder import MeetingRecorder, RecordingResult
 from audio.system_audio import list_loopback_devices
+from client.api_client import ApiClientError, ApiConnectionError, TeamMeetingAIClient
 from config import Settings
-from storage import library as ops
-from storage.library import MeetingLibrary
+from ui.qt_utils import worker_running
 
 
 class _StopWorker(QThread):
-    """Finalise and persist a recording without blocking the UI thread."""
+    """Finalise the local WAV and upload it to the server off the UI thread."""
 
-    completed = Signal(object)
+    completed = Signal(object, object)  # meeting dict (or None), message
     failed = Signal(str)
 
     def __init__(
         self,
-        library: MeetingLibrary,
-        settings: Settings,
+        client: TeamMeetingAIClient,
+        user_id: str,
+        title: str,
         recorder: MeetingRecorder,
-        meeting_id: str,
+        work_dir: Path,
     ) -> None:
         super().__init__()
-        self.library = library
-        self.settings = settings
+        self.client = client
+        self.user_id = user_id
+        self.title = title
         self.recorder = recorder
-        self.meeting_id = meeting_id
+        self.work_dir = work_dir
 
-    def run(self) -> None:  # pragma: no cover - exercised on audio hardware
+    def run(self) -> None:
+        meeting: dict[str, Any] | None = None
+        failure: str | None = None
         try:
             result: RecordingResult = self.recorder.stop()
-            ops.finish_recording(
-                self.library,
-                self.meeting_id,
-                relative_path=result.relative_path,
-                format=result.format,
-                duration_seconds=result.duration_seconds,
-                size_bytes=result.size_bytes,
+            meeting = self.client.upload_recording(
+                title=self.title,
+                user_id=self.user_id,
+                audio=result.absolute_path,
+                filename=result.absolute_path.name,
+                duration_ms=int(round(result.duration_seconds * 1000)),
                 sample_rate=result.sample_rate,
                 channels=result.channels,
-                mic_relative_path=result.microphone_relative_path,
-                system_relative_path=result.system_relative_path,
             )
+        except (ApiClientError, ApiConnectionError) as exc:
+            failure = str(exc)
         except Exception as exc:
-            try:
-                ops.mark_meeting_failed(self.library, self.meeting_id, str(exc))
-            except Exception:
-                pass
-            self.failed.emit(str(exc))
+            failure = f"Unexpected error: {type(exc).__name__}: {exc}"
+        finally:
+            # The temporary capture directory is only needed until upload;
+            # the server keeps the audio in PostgreSQL from here on.
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+        if failure is not None:
+            self.failed.emit(failure)
             return
-        self.completed.emit(result)
+        self.completed.emit(meeting, None)
 
 
 class RecordingScreen(QWidget):
-    recording_saved = Signal(str)
+    """Record locally, then upload the finished WAV to the team server."""
+
+    recording_saved = Signal(str)  # server meeting id
     cancelled = Signal()
 
     _capture_error = Signal(str)
 
     def __init__(
-        self, library: MeetingLibrary, settings: Settings, parent: QWidget | None = None
+        self,
+        client: TeamMeetingAIClient,
+        settings: Settings,
+        parent: QWidget | None = None,
+        *,
+        can_record: bool = True,
     ) -> None:
         super().__init__(parent)
-        self.library = library
+        self.client = client
         self.settings = settings
         self.current_user: dict[str, Any] | None = None
         self._recorder: MeetingRecorder | None = None
-        self._meeting_id: str | None = None
+        self._work_dir: Path | None = None
         self._stop_worker: _StopWorker | None = None
         self._state = "idle"
         self._microphones: dict[str, AudioDevice] = {}
         self._loopbacks: dict[str, AudioDevice] = {}
+        self._can_record = can_record
 
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(500)
@@ -106,7 +123,7 @@ class RecordingScreen(QWidget):
         self._build_ui()
         self.refresh_devices()
 
-    # -- UI construction ----------------------------------------------
+    # -- UI construction ---------------------------------------------------
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -126,8 +143,10 @@ class RecordingScreen(QWidget):
 
         consent = QLabel(
             "Recording requires consent from all participants. Start recording "
-            "only when everyone has agreed. A clear indicator and elapsed timer "
-            "remain visible while recording."
+            "only when everyone has agreed. After you stop, the audio is "
+            "uploaded to the team server and sent to Sarvam (cloud) for "
+            "transcription. A clear indicator and elapsed timer remain visible "
+            "while recording."
         )
         consent.setWordWrap(True)
         consent.setObjectName("consentText")
@@ -160,7 +179,9 @@ class RecordingScreen(QWidget):
         devices_layout.addWidget(self.loopback_combo, 1, 1)
 
         self.refresh_devices_button = QPushButton("Refresh devices")
-        self.refresh_devices_button.setToolTip("Refresh the list of available audio devices.")
+        self.refresh_devices_button.setToolTip(
+            "Refresh the list of available audio devices."
+        )
         self.refresh_devices_button.clicked.connect(self.refresh_devices)
         devices_layout.addWidget(self.refresh_devices_button, 2, 1)
         devices_layout.setColumnStretch(1, 1)
@@ -217,29 +238,37 @@ class RecordingScreen(QWidget):
         layout.addWidget(self.error_label)
         layout.addStretch(1)
 
+        if not self._can_record:
+            self.status_label.setText(
+                "Recording is only possible on the meeting host computer "
+                "(the machine with the microphone and the meeting audio)."
+            )
+
         self._update_state_ui()
 
-    # -- lifecycle -----------------------------------------------------
+    # -- lifecycle ---------------------------------------------------------
 
     @property
     def is_recording(self) -> bool:
         return self._state == "recording"
 
-    def set_library(
-        self, library: MeetingLibrary, settings: Settings | None = None
-    ) -> None:
-        """Point the screen at a different library (blocked while recording)."""
-
-        self.library = library
-        if settings is not None:
-            self.settings = settings
-
     def set_user(self, user: dict[str, Any]) -> None:
         self.current_user = user
 
+    def set_can_record(self, can_record: bool) -> None:
+        """Enable/disable recording (host machine only)."""
+
+        self._can_record = can_record
+        if not can_record:
+            self.status_label.setText(
+                "Recording is only possible on the meeting host computer "
+                "(the machine with the microphone and the meeting audio)."
+            )
+        self._update_state_ui()
+
     def prepare_new(self) -> None:
-        self._meeting_id = None
         self._recorder = None
+        self._work_dir = None
         self.title_edit.clear()
         self._show_error("")
         self.elapsed_label.setText("00:00:00")
@@ -254,7 +283,7 @@ class RecordingScreen(QWidget):
     def resume_devices(self) -> None:
         self.refresh_devices()
 
-    # -- devices -------------------------------------------------------
+    # -- devices -----------------------------------------------------------
 
     def refresh_devices(self) -> None:
         self._show_error("")
@@ -291,13 +320,18 @@ class RecordingScreen(QWidget):
         if combo.currentData() is None and combo.count():
             combo.setCurrentIndex(0)
 
-    # -- recording state ----------------------------------------------
+    # -- recording state -----------------------------------------------------
 
     def _start_recording(self) -> None:
         if self._state != "idle":
             return
+        if not self._can_record:
+            self._show_error(
+                "Recording is only possible on the meeting host computer."
+            )
+            return
         if self.current_user is None:
-            self._show_error("Choose a local profile before recording.")
+            self._show_error("Choose a profile before recording.")
             return
         title = self.title_edit.text().strip()
         if not title:
@@ -312,46 +346,54 @@ class RecordingScreen(QWidget):
             return
 
         self._show_error("")
-        meeting: dict[str, Any] | None = None
+        # The meeting record is created on the server only after a successful
+        # stop+upload; during capture the audio lives in a temporary directory.
+        work_dir = Path(tempfile.mkdtemp(prefix="tma-capture-"))
+        local_id = str(uuid.uuid4())
         try:
-            meeting = ops.create_meeting(
-                self.library, int(self.current_user["id"]), title
-            )
             recorder = MeetingRecorder(
                 self.settings,
                 microphone_id=str(self.microphone_combo.currentData()),
                 system_device_id=str(self.loopback_combo.currentData()),
                 on_error=lambda message: self._capture_error.emit(message),
             )
-            recorder.start(meeting["id"], Path(meeting["meeting_dir"]))
+            recorder.start(local_id, work_dir)
         except Exception as exc:
-            if meeting is not None:
-                try:
-                    ops.mark_meeting_failed(self.library, meeting["id"], str(exc))
-                except Exception:
-                    pass
+            shutil.rmtree(work_dir, ignore_errors=True)
             self._show_error(str(exc) or "Recording could not be started.")
             self._state = "idle"
             self._update_state_ui()
             return
 
-        self._meeting_id = meeting["id"]
         self._recorder = recorder
+        self._work_dir = work_dir
         self._state = "recording"
         self._elapsed_timer.start()
         self._update_elapsed()
         self._update_state_ui()
 
     def _stop_recording(self) -> None:
-        if self._state != "recording" or self._recorder is None or self._meeting_id is None:
+        if (
+            self._state != "recording"
+            or self._recorder is None
+            or self._work_dir is None
+            or self.current_user is None
+        ):
             return
+        title = self.title_edit.text().strip()
+        if not title:
+            title = "Untitled meeting"
         self._state = "finalising"
         self._elapsed_timer.stop()
         self._update_state_ui()
-        self.status_label.setText("Finalising the recording file...")
+        self.status_label.setText("Finalising and uploading the recording...")
 
         worker = _StopWorker(
-            self.library, self.settings, self._recorder, self._meeting_id
+            self.client,
+            str(self.current_user["id"]),
+            title,
+            self._recorder,
+            self._work_dir,
         )
         worker.completed.connect(self._on_recording_saved)
         worker.failed.connect(self._on_recording_failed)
@@ -363,19 +405,19 @@ class RecordingScreen(QWidget):
     def _clear_stop_worker(self) -> None:
         self._stop_worker = None
 
-    def _on_recording_saved(self, result: object) -> None:
-        meeting_id = self._meeting_id
+    def _on_recording_saved(self, meeting: object, _message: object) -> None:
         self._recorder = None
+        self._work_dir = None
         self._state = "idle"
         self.elapsed_label.setText("00:00:00")
-        self.status_label.setText("Recording saved locally.")
+        self.status_label.setText("Recording uploaded. Transcription is queued.")
         self._update_state_ui()
-        if meeting_id:
-            self.recording_saved.emit(meeting_id)
+        if isinstance(meeting, dict) and meeting.get("id"):
+            self.recording_saved.emit(str(meeting["id"]))
 
     def _on_recording_failed(self, message: str) -> None:
         self._recorder = None
-        self._meeting_id = None
+        self._work_dir = None
         self._state = "idle"
         self.status_label.setText("Recording could not be completed.")
         self._show_error(message or "Recording failed.")
@@ -403,7 +445,9 @@ class RecordingScreen(QWidget):
             self.microphone_combo.currentData() is not None
             and self.loopback_combo.currentData() is not None
         )
-        self.start_button.setEnabled(idle and devices_ready)
+        self.start_button.setEnabled(
+            idle and devices_ready and self._can_record
+        )
         self.stop_button.setEnabled(recording)
         self.back_button.setEnabled(not finalising)
         self.refresh_devices_button.setEnabled(idle)
@@ -415,7 +459,7 @@ class RecordingScreen(QWidget):
             self.indicator_label.setText("●  RECORDING")
             self.indicator_label.setObjectName("recordingActive")
         elif finalising:
-            self.indicator_label.setText("FINALISING")
+            self.indicator_label.setText("UPLOADING")
             self.indicator_label.setObjectName("recordingFinalising")
         else:
             self.indicator_label.setText("Idle")
@@ -428,14 +472,14 @@ class RecordingScreen(QWidget):
         self.error_label.setText(message)
         self.error_label.setVisible(bool(message))
 
-    # -- navigation ----------------------------------------------------
+    # -- navigation ------------------------------------------------------
 
     def _go_back(self) -> None:
         if self._state == "finalising":
             QMessageBox.information(
                 self,
                 "Finishing recording",
-                "Please wait while the recording file is finalised.",
+                "Please wait while the recording is uploaded to the server.",
             )
             return
         if self._state == "recording":
@@ -443,7 +487,7 @@ class RecordingScreen(QWidget):
                 self,
                 "Discard recording",
                 "Discard the current recording? The audio captured so far will "
-                "be deleted.",
+                "be deleted and nothing is uploaded.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -453,7 +497,7 @@ class RecordingScreen(QWidget):
         self.cancelled.emit()
 
     def _discard_recording(self) -> None:
-        meeting_id = self._meeting_id
+        work_dir = self._work_dir
         self._elapsed_timer.stop()
         if self._recorder is not None:
             try:
@@ -461,30 +505,16 @@ class RecordingScreen(QWidget):
             except Exception:
                 pass
         self._recorder = None
-        self._meeting_id = None
-        if meeting_id:
-            try:
-                ops.delete_meeting(self.library, meeting_id)
-            except Exception:
-                pass
+        self._work_dir = None
+        if work_dir is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
         self._state = "idle"
         self._update_state_ui()
 
     def shutdown(self) -> None:
-        """Cancel an active recording when the application is closing."""
+        """Discard an active recording when the application is closing."""
 
-        if self._state == "recording" and self._recorder is not None:
-            meeting_id = self._meeting_id
-            try:
-                self._recorder.cancel()
-            except Exception:
-                pass
-            if meeting_id:
-                try:
-                    ops.mark_meeting_failed(
-                        self.library, meeting_id, "Application closed during recording."
-                    )
-                except Exception:
-                    pass
-        if self._stop_worker is not None:
-            self._stop_worker.wait(10000)
+        if self._state == "recording":
+            self._discard_recording()
+        if worker_running(self._stop_worker):
+            self._stop_worker.wait(10_000)

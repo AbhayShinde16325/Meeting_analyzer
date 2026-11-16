@@ -38,13 +38,14 @@ Implemented in this repository:
   **Re-transcribe** and asks for confirmation because it replaces the
   transcript **and deletes the saved analysis** (so stale notes can never
   disagree with the new transcript).
-- **Me / Remote speaker labels**: transcription runs on the two separated
-  tracks recorded during the meeting - the microphone track is labelled
-  `Me` and the system-audio track (remote participants) is labelled
-  `Remote`. Segments are merged in timestamp order. If a track file is
-  missing (older recordings) the mixed recording is transcribed without
-  labels. **Use headphones for correct labels**: with speakers, your
-  microphone also picks up the remote voices.
+- **Single-pass transcription**: the mixed `audio.wav` is transcribed once.
+  The earlier build transcribed the microphone and system tracks separately
+  and labelled them `Me`/`Remote`, which roughly doubled the processing time.
+  The labels were dropped in favour of one faster pass; older transcripts
+  that still contain labels keep displaying them.
+- **Speed tuning for local CPUs**: greedy decoding (`beam_size=1`), voice
+  activity detection, and no cross-window text conditioning. See
+  [Transcription speed and language accuracy](#transcription-speed-and-language-accuracy).
 - **Cancellation**: a **Cancel** button appears while processing. Cancellation
   is cooperative - the meeting returns to its previous status, no partial
   transcript is saved, and cancelling a re-transcription keeps the old
@@ -169,7 +170,7 @@ Only two things are stored on disk:
         audio.wav                     # mixed recording used for playback/AI
         mic.wav                       # separate microphone track
         system.wav                    # separate system-audio track
-        transcript.md                 # human-readable transcript (timestamps + Me/Remote)
+        transcript.md                 # human-readable transcript (timestamps)
         analysis.md                   # human-readable meeting notes
 ```
 
@@ -228,8 +229,10 @@ Other optional environment overrides:
 | `TEAMMEETINGAI_WHISPER_MODEL` | `small` (model size or local model directory) |
 | `TEAMMEETINGAI_WHISPER_DEVICE` | `cpu` |
 | `TEAMMEETINGAI_WHISPER_COMPUTE_TYPE` | `int8` |
-| `TEAMMEETINGAI_WHISPER_LANGUAGE` | blank (auto-detect the spoken language) |
-| `TEAMMEETINGAI_WHISPER_BEAM_SIZE` | `5` |
+| `TEAMMEETINGAI_WHISPER_LANGUAGE` | blank (auto-detect; set e.g. `hi` for Hindi) |
+| `TEAMMEETINGAI_WHISPER_INITIAL_PROMPT` | blank (optional script/vocabulary hint; a short Hindi sentence keeps output in Devanagari) |
+| `TEAMMEETINGAI_WHISPER_BEAM_SIZE` | `1` (greedy decoding; higher values use slower beam search) |
+| `TEAMMEETINGAI_WHISPER_VAD_MIN_SILENCE_MS` | `500` |
 | `TEAMMEETINGAI_WHISPER_CPU_THREADS` | `0` (use the engine default) |
 | `TEAMMEETINGAI_ANALYSIS_BACKEND` | `none` (`groq` enables cloud analysis) |
 | `TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS` | unset (must be `1` to opt in) |
@@ -311,6 +314,55 @@ The analysis prompt instructs the model that the transcript is untrusted data,
 forbids inventing owners or deadlines, and the response is validated against
 the schema in `ai/task_extractor.py` (with one retry) before anything is
 stored.
+
+## Transcription speed and language accuracy
+
+Transcription is the slow stage, so it is tuned for CPU-only laptops:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| Recording passed to Whisper | mixed `audio.wav` | one pass instead of two (microphone + system tracks) |
+| `TEAMMEETINGAI_WHISPER_BEAM_SIZE` | `1` | greedy decoding, the fastest option |
+| `condition_on_previous_text` | off | every window is decoded independently, which avoids repetition loops |
+| `TEAMMEETINGAI_WHISPER_VAD_MIN_SILENCE_MS` | `500` | quiet stretches are skipped instead of being "transcribed" into invented sentences |
+| `TEAMMEETINGAI_WHISPER_COMPUTE_TYPE` | `int8` | fastest CPU compute type |
+| silence pre-check | on | an all-silent recording never loads the model; the check streams the WAV in chunks, so a long meeting is not loaded into memory just to be measured |
+
+Remaining levers, in order of impact:
+
+1. **Model size** - `TEAMMEETINGAI_WHISPER_MODEL` (`base`, `small`,
+   `large-v3-turbo`, ...). Smaller is faster and less accurate;
+   `large-v3-turbo` is the fastest multilingual option when the machine
+   allows it.
+2. **CPU threads** - `TEAMMEETINGAI_WHISPER_CPU_THREADS` (default: decided
+   by the engine).
+3. **Beam size above 1** trades speed for a small accuracy gain.
+
+### Guardrails against gibberish (especially Hindi)
+
+1. **Pin the language.** `TEAMMEETINGAI_WHISPER_LANGUAGE=hi` is the single
+   most effective fix. Auto-detection only looks at the start of the audio,
+   and a Hindi meeting is easily labelled as English (romanized text),
+   Urdu, or Nepali.
+2. **Give it a script hint.** Set `TEAMMEETINGAI_WHISPER_INITIAL_PROMPT` to
+   one short sentence in Devanagari (for example `यह बैठक हिंदी में है।`).
+   It biases the decoder towards Devanagari spelling and the meeting's
+   vocabulary; the prompt is forwarded to the model as text and is never
+   executed.
+3. **Do not use a tiny model for Hindi.** `tiny`/`base` cannot produce
+   reliable Hindi. `small` is the practical minimum and `medium` is
+   noticeably better but slower.
+4. **Keep voice-activity detection on** (it always is) and leave
+   `TEAMMEETINGAI_WHISPER_VAD_MIN_SILENCE_MS` at 500 or higher. Whisper
+   invents sentences in silence, a common source of nonsense text.
+5. **Watch the log.** The app logs the detected language and its confidence
+   (a `Low language-detection confidence` warning) and warns when a
+   Devanagari-language transcript contains no Devanagari characters at all.
+   Neither message contains transcript text.
+6. **Mixed-language meetings stay hard.** If participants switch between
+   Hindi and English, pinning `hi` may romanize the English parts and vice
+   versa. Pick the language most of the meeting is spoken in; the transcript
+   in the meeting folder can be edited afterwards.
 
 ## Architecture
 
@@ -405,6 +457,17 @@ playback/transcription when the audio file has been moved or deleted. If you
 moved the whole library folder, update the library location (or set
 `TEAMMEETINGAI_LIBRARY_DIR`) so the app points at the new place.
 
+### The transcript is gibberish or in the wrong language
+
+- Pin the language before transcribing: set
+  `TEAMMEETINGAI_WHISPER_LANGUAGE=hi` (or whichever language is spoken), then
+  use **Re-transcribe**.
+- Add a short `TEAMMEETINGAI_WHISPER_INITIAL_PROMPT` in the expected script.
+- Switch to a larger model (`TEAMMEETINGAI_WHISPER_MODEL=medium` or
+  `large-v3-turbo`); `tiny`/`base` are not reliable for Hindi.
+- Check `%LOCALAPPDATA%\TeamMeetingAI\teammeetingai.log` for the
+  language-confidence and script warnings.
+
 ### Processing says no provider is configured
 
 Transcription uses the Faster-Whisper package; if it is missing, install the
@@ -429,12 +492,11 @@ pointing `TEAMMEETINGAI_WHISPER_MODEL` at a local model directory instead.
 
 - Windows-only audio capture.
 - Echo cancellation is not implemented.
-- Real speaker identification is not implemented: labels come from the audio
-  tracks (`Me` = microphone, `Remote` = system audio), so a user's real name is
-  never attached automatically, and speakers without headphones can bleed into
-  both tracks.
-- Transcription runs the microphone and system tracks sequentially, so it takes
-  roughly twice as long as transcribing a single file.
+- Speaker identification is not implemented. The transcript is one unlabeled
+  stream from the mixed recording, so who said what is not distinguished.
+- Recognition quality depends on the Whisper model size and the pinned
+  language; a small model on a Hindi meeting can still produce romanized or
+  inaccurate text. See the guardrails below.
 - The `ollama` analysis backend is reserved but not wired; no local-LLM
   analysis is available in this build.
 - No automatic recording, calendar integration, cloud sync, or meeting bot.

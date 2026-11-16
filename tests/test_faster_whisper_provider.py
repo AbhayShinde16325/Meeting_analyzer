@@ -21,9 +21,12 @@ class FakeSegment:
 
 
 class FakeInfo:
-    def __init__(self, duration: float, language: str | None) -> None:
+    def __init__(
+        self, duration: float, language: str | None, language_probability: float = 0.98
+    ) -> None:
         self.duration = duration
         self.language = language
+        self.language_probability = language_probability
 
 
 class FakeWhisperModel:
@@ -103,10 +106,13 @@ def test_transcribe_options_and_result(provider, settings, monkeypatch, wav_fact
     model = FakeWhisperModel.instances[-1]
     call_path, kwargs = model.transcribe_calls[0]
     assert call_path == str(path)
-    assert kwargs["beam_size"] == 5
+    # Greedy decoding is the default now: fastest option.
+    assert kwargs["beam_size"] == 1
     assert kwargs["vad_filter"] is True
-    assert kwargs["condition_on_previous_text"] is True
+    assert kwargs["vad_parameters"] == {"min_silence_duration_ms": 500}
+    assert kwargs["condition_on_previous_text"] is False
     assert kwargs["language"] == "es"
+    assert "initial_prompt" not in kwargs
 
     assert isinstance(result, TranscriptionResult)
     assert result.language == "en"
@@ -242,3 +248,109 @@ def test_unreadable_file_is_not_treated_as_silent(
     assert FakeWhisperModel.instances, (
         "a file that cannot be inspected must not be skipped as silence"
     )
+
+
+def test_long_silence_is_detected_across_chunks(
+    provider, settings, monkeypatch, wav_factory
+):
+    """The chunked scan must still recognise a long silent recording."""
+
+    install_fake_faster_whisper(monkeypatch)
+    # 4 seconds at 48 kHz is well past one scan chunk at 16-bit stereo.
+    silent = wav_factory(
+        settings.recordings_dir / "long-silent.wav", seconds=4.0, amplitude=0.0
+    )
+
+    result = provider.transcribe(silent)
+
+    assert result.text == ""
+    assert FakeWhisperModel.instances == []
+
+
+# ---------------------------------------------------------------------------
+# Hindi / Devanagari guardrails
+# ---------------------------------------------------------------------------
+
+
+def test_initial_prompt_is_forwarded(settings, monkeypatch, wav_factory):
+    install_fake_faster_whisper(monkeypatch)
+    prompt = "यह एक हिंदी बैठक है।"
+    provider = FasterWhisperProvider(
+        replace(settings, whisper_initial_prompt=prompt)
+    )
+    path = wav_factory(settings.recordings_dir / "sample.wav")
+    provider.transcribe(path)
+
+    _, kwargs = FakeWhisperModel.instances[-1].transcribe_calls[0]
+    assert kwargs["initial_prompt"] == prompt
+
+
+def test_blank_initial_prompt_is_not_forwarded(provider, settings, monkeypatch, wav_factory):
+    install_fake_faster_whisper(monkeypatch)
+    path = wav_factory(settings.recordings_dir / "sample.wav")
+    provider.transcribe(path)
+
+    _, kwargs = FakeWhisperModel.instances[-1].transcribe_calls[0]
+    assert "initial_prompt" not in kwargs
+
+
+def test_vad_silence_threshold_is_configurable(settings, monkeypatch, wav_factory):
+    install_fake_faster_whisper(monkeypatch)
+    provider = FasterWhisperProvider(
+        replace(settings, whisper_vad_min_silence_ms=900)
+    )
+    path = wav_factory(settings.recordings_dir / "sample.wav")
+    provider.transcribe(path)
+
+    _, kwargs = FakeWhisperModel.instances[-1].transcribe_calls[0]
+    assert kwargs["vad_parameters"] == {"min_silence_duration_ms": 900}
+
+
+def test_low_language_confidence_is_logged(
+    provider, settings, monkeypatch, wav_factory, caplog
+):
+    import logging
+
+    module = install_fake_faster_whisper(monkeypatch)
+
+    class LowConfidenceModel(FakeWhisperModel):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.info = FakeInfo(5.0, "hi", language_probability=0.21)
+
+    module.WhisperModel = LowConfidenceModel
+    path = wav_factory(settings.recordings_dir / "sample.wav")
+
+    with caplog.at_level(logging.WARNING, logger="ai.faster_whisper_provider"):
+        provider.transcribe(path)
+
+    messages = [record.message for record in caplog.records]
+    assert any("Low language-detection confidence" in message for message in messages)
+    # The log must never contain the transcript itself.
+    assert all("Hello there" not in message for message in messages)
+
+
+def test_script_mismatch_helper_flags_romanized_hindi():
+    from ai.faster_whisper_provider import _script_mismatch_warning
+
+    warning = _script_mismatch_warning(
+        "aaj hum release plan karenge aur kal test karenge", "hi"
+    )
+    assert warning and "Latin" in warning
+
+
+def test_script_mismatch_helper_accepts_devanagari():
+    from ai.faster_whisper_provider import _script_mismatch_warning
+
+    assert (
+        _script_mismatch_warning(
+            "आज हम रिलीज़ प्लान करेंगे और कल टेस्ट करेंगे।", "hi"
+        )
+        is None
+    )
+
+
+def test_script_mismatch_helper_ignores_other_languages():
+    from ai.faster_whisper_provider import _script_mismatch_warning
+
+    assert _script_mismatch_warning("hello there, this is English", "en") is None

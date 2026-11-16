@@ -29,6 +29,23 @@ from config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Languages written in Devanagari script.  A transcript in one of these
+# languages that comes back mostly in Latin letters is almost certainly
+# romanized or misdetected output rather than a usable transcript.
+_DEVANAGARI_LANGUAGES = {"hi", "mr", "ne", "sa", "bho"}
+
+# Frames per read when checking a recording for silence.  Reading in bounded
+# chunks keeps a multi-hour meeting from being loaded into memory twice.
+_SILENCE_CHUNK_FRAMES = 262_144
+
+# PCM layouts the silence check understands: sample width -> (numpy dtype,
+# full-scale divisor, unsigned offset).
+_PCM_LAYOUTS: dict[int, tuple[str | None, float, float]] = {
+    1: ("uint8", 128.0, 128.0),
+    2: ("<i2", 32768.0, 0.0),
+    4: ("<i4", 2147483648.0, 0.0),
+}
+
 
 class FasterWhisperProvider:
     """Transcription provider backed by a local Faster-Whisper model."""
@@ -122,38 +139,36 @@ class FasterWhisperProvider:
 
         Returns ``False`` whenever the file cannot be inspected (missing,
         unreadable, or not a supported WAV layout) so real audio is never
-        skipped by mistake.  A silent file would only cost Whisper a VAD
-        scan and language detection that produce nothing, so skipping it
-        roughly halves the processing time when one track was not captured.
+        skipped by mistake.  The scan reads bounded chunks, so a long
+        recording is never held in memory just to be measured.
         """
 
         try:
             with wave.open(str(audio_path), "rb") as wav:
-                frames = wav.readframes(wav.getnframes())
                 sample_width = wav.getsampwidth()
+                dtype, scale, offset = _PCM_LAYOUTS.get(sample_width, (None, None, 0.0))
+                if dtype is None:
+                    return False
+
+                saw_frames = False
+                peak = 0.0
+                while True:
+                    raw = wav.readframes(_SILENCE_CHUNK_FRAMES)
+                    if not raw:
+                        break
+                    saw_frames = True
+                    samples = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+                    if offset:
+                        samples = samples - offset
+                    samples /= scale
+                    if samples.size:
+                        peak = max(peak, float(np.max(np.abs(samples))))
+                        if peak >= self._SILENCE_PEAK_THRESHOLD:
+                            return False
         except (wave.Error, EOFError, OSError):
             return False
 
-        if not frames:
-            return True
-
-        if sample_width == 2:
-            samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
-        elif sample_width == 4:
-            samples = (
-                np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
-            )
-        elif sample_width == 1:
-            samples = (
-                np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0
-            ) / 128.0
-        else:
-            return False
-
-        if samples.size == 0:
-            return True
-        peak = float(np.max(np.abs(samples)))
-        return peak < self._SILENCE_PEAK_THRESHOLD
+        return not saw_frames or peak < self._SILENCE_PEAK_THRESHOLD
 
     def transcribe(
         self,
@@ -175,14 +190,30 @@ class FasterWhisperProvider:
 
         model = self._load_model()
 
+        # An explicit language is the single most effective guardrail: with
+        # auto-detection a Hindi meeting is easily misdetected and decoded
+        # into gibberish.  ``TEAMMEETINGAI_WHISPER_LANGUAGE=hi`` pins it.
         requested_language = language or (self.settings.whisper_language or None)
+        initial_prompt = (self.settings.whisper_initial_prompt or "").strip()
         options: dict[str, object] = {
+            # Greedy decoding is markedly faster than the beam search default
+            # and is what makes a long meeting finish in reasonable time.
             "beam_size": self.settings.whisper_beam_size,
             "vad_filter": True,
-            "condition_on_previous_text": True,
+            "vad_parameters": {
+                "min_silence_duration_ms": self.settings.whisper_vad_min_silence_ms
+            },
+            # Decoding each window independently avoids the repetition loops
+            # and invented sentences that conditioning can produce, and is
+            # slightly cheaper as well.
+            "condition_on_previous_text": False,
         }
         if requested_language:
             options["language"] = requested_language
+        if initial_prompt:
+            # Biases spelling and script (e.g. Devanagari) without adding
+            # content; it is forwarded to the model, never executed.
+            options["initial_prompt"] = initial_prompt
 
         if progress_cb is not None:
             progress_cb(0.05, "Transcribing audio locally...")
@@ -210,6 +241,15 @@ class FasterWhisperProvider:
                 progress_cb(fraction, "Transcribing audio...")
 
         full_text = "\n".join(str(item["text"]) for item in collected).strip()
+        detected_language = getattr(info, "language", None)
+        self._log_language_confidence(
+            detected_language,
+            float(getattr(info, "language_probability", 0.0) or 0.0),
+            pinned=bool(requested_language),
+        )
+        warning = _script_mismatch_warning(full_text, detected_language)
+        if warning:
+            logger.warning("%s", warning)
         elapsed = time.monotonic() - started
         audio_duration = float(getattr(info, "duration", 0.0) or 0.0)
         if audio_duration > 0 and elapsed > 0:
@@ -224,9 +264,33 @@ class FasterWhisperProvider:
             logger.info("Transcribed %s in %.1fs.", audio_path.name, elapsed)
         return TranscriptionResult(
             text=full_text,
-            language=getattr(info, "language", None),
+            language=detected_language,
             segments=collected,
         )
+
+    @staticmethod
+    def _log_language_confidence(
+        language: str | None, probability: float, *, pinned: bool
+    ) -> None:
+        """Log language detection quality without logging transcript text."""
+
+        if not language:
+            return
+        if pinned:
+            logger.info(
+                "Transcribed with pinned language '%s' (auto-detect: %.2f).",
+                language,
+                probability,
+            )
+            return
+        if probability and probability < 0.5:
+            logger.warning(
+                "Low language-detection confidence (%.2f) for '%s'; the "
+                "transcript may be inaccurate. Consider pinning "
+                "TEAMMEETINGAI_WHISPER_LANGUAGE.",
+                probability,
+                language,
+            )
 
     # -- cancellation ----------------------------------------------------
 
@@ -234,3 +298,39 @@ class FasterWhisperProvider:
     def _check_cancelled(cancel_cb) -> None:
         if cancel_cb is not None and cancel_cb():
             raise TranscriptionCancelled("Transcription was cancelled.")
+
+
+def _script_mismatch_warning(text: str, language: str | None) -> str | None:
+    """Warn when a Devanagari-script language came back in Latin letters.
+
+    Whisper sometimes detects Hindi correctly but writes romanized text, and
+    sometimes misdetects it as English altogether.  Both produce a transcript
+    that reads as gibberish.  This only counts characters - transcript content
+    itself is never logged - so a silent failure at least becomes visible in
+    the log.
+    """
+
+    if not text or not isinstance(language, str):
+        return None
+    if language.split("-")[0].lower() not in _DEVANAGARI_LANGUAGES:
+        return None
+
+    devanagari = 0
+    latin = 0
+    for character in text:
+        if "\u0900" <= character <= "\u097f":
+            devanagari += 1
+        elif character.isascii() and character.isalpha():
+            latin += 1
+
+    letters = devanagari + latin
+    # Too little text to judge, and any Devanagari at all means the model did
+    # produce the expected script.
+    if letters < 20 or devanagari:
+        return None
+    return (
+        f"Transcript for language '{language}' contains {latin} Latin letters "
+        "and no Devanagari script. The recognition may be romanized or "
+        "misdetected; check TEAMMEETINGAI_WHISPER_LANGUAGE and "
+        "TEAMMEETINGAI_WHISPER_INITIAL_PROMPT."
+    )

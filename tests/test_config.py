@@ -10,7 +10,6 @@ from config import ensure_directories, load_settings
 def test_sandbox_settings_use_temp_data_dir(settings):
     assert settings.data_dir.name == "data"
     assert settings.recordings_dir == settings.data_dir / "recordings"
-    assert settings.library_dir == settings.data_dir / "library"
     assert settings.data_dir.is_dir()
 
 
@@ -38,7 +37,8 @@ def test_invalid_environment_numbers_fall_back_to_defaults(tmp_path, monkeypatch
     assert loaded.audio_sample_rate == 48_000
     assert loaded.llm_temperature == 0.2
     assert loaded.groq_timeout == 60.0
-    assert loaded.whisper_beam_size == 5
+    # Greedy decoding is the configured default (fastest).
+    assert loaded.whisper_beam_size == 1
 
 
 def test_analysis_backend_and_cloud_opt_in_defaults(settings):
@@ -79,6 +79,22 @@ def test_whisper_tuning_env(tmp_path, monkeypatch):
     assert loaded.whisper_language == "en"
     assert loaded.whisper_beam_size == 3
     assert loaded.whisper_cpu_threads == 4
+
+
+def test_whisper_hindi_guardrail_defaults(settings):
+    assert settings.whisper_initial_prompt == ""
+    assert settings.whisper_vad_min_silence_ms == 500
+
+
+def test_whisper_hindi_guardrail_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEAMMEETINGAI_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("TEAMMEETINGAI_WHISPER_LANGUAGE", "hi")
+    monkeypatch.setenv("TEAMMEETINGAI_WHISPER_INITIAL_PROMPT", "यह बैठक हिंदी में है।")
+    monkeypatch.setenv("TEAMMEETINGAI_WHISPER_VAD_MIN_SILENCE_MS", "800")
+    loaded = load_settings()
+    assert loaded.whisper_language == "hi"
+    assert loaded.whisper_initial_prompt == "यह बैठक हिंदी में है।"
+    assert loaded.whisper_vad_min_silence_ms == 800
 
 
 def test_ensure_directories_creates_data_dir(tmp_path):

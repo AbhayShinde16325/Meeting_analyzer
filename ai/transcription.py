@@ -29,11 +29,6 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
 
-# Speaker labels used for dual-track transcription.  The microphone track is
-# the local user; the system-audio track carries the remote participants.
-SPEAKER_ME = "Me"
-SPEAKER_REMOTE = "Remote"
-
 
 class TranscriptionError(RuntimeError):
     """Raised when audio cannot be transcribed."""
@@ -191,136 +186,13 @@ class TranscriptionService:
             segments=segments,
         )
 
-    def transcribe_meeting(
-        self,
-        mixed_path: str | Path,
-        mic_path: str | Path,
-        system_path: str | Path,
-        *,
-        language: str | None = None,
-        progress_cb: ProgressCallback | None = None,
-        cancel_cb: Callable[[], bool] | None = None,
-    ) -> TranscriptionResult:
-        """Transcribe a recorded meeting from its separated audio tracks.
-
-        The microphone track is labelled ``Me`` and the system-audio track
-        (remote participants) is labelled ``Remote``.  Segments from both
-        tracks are merged in timestamp order and the transcript text is
-        prefixed with the speaker label per line.
-
-        Behaviour:
-
-        * Both track files present - two provider runs, merged labels.
-        * Exactly one track present - that run alone keeps its label.
-        * Neither track present - fall back to the mixed recording with no
-          labels (older recordings only stored the mixed file).
-        * A track exists but contains no speech - it is skipped; if every
-          available track is silent the original no-speech error is raised.
-        """
-
-        mixed = Path(mixed_path)
-        mic = Path(mic_path)
-        system = Path(system_path)
-
-        tracks: list[tuple[Path, str]] = []
-        if mic.is_file():
-            tracks.append((mic, SPEAKER_ME))
-        if system.is_file():
-            tracks.append((system, SPEAKER_REMOTE))
-
-        if not tracks:
-            logger.info("No separated tracks found; using the mixed recording.")
-            return self.transcribe(
-                mixed,
-                language=language,
-                progress_cb=progress_cb,
-                cancel_cb=cancel_cb,
-            )
-
-        if progress_cb is not None:
-            progress_cb(0.02, "Preparing recording for transcription...")
-
-        total = len(tracks)
-        merged: list[dict[str, object]] = []
-        detected_language: str | None = None
-        no_speech_error: NoSpeechError | None = None
-
-        for index, (track_path, label) in enumerate(tracks):
-            base = index / total
-            span = 1.0 / total
-
-            def track_progress(
-                fraction: float,
-                message: str,
-                *,
-                _base: float = base,
-                _span: float = span,
-                _label: str = label,
-            ) -> None:
-                if progress_cb is None:
-                    return
-                clamped = min(1.0, max(0.0, fraction))
-                progress_cb(
-                    _base + clamped * _span,
-                    f"Transcribing {_label} audio: {message}",
-                )
-
-            try:
-                result = self.transcribe(
-                    track_path,
-                    language=language,
-                    progress_cb=track_progress,
-                    cancel_cb=cancel_cb,
-                )
-            except TranscriptionCancelled:
-                raise
-            except NoSpeechError as exc:
-                logger.info(
-                    "The %s track contains no recognizable speech; skipping it.",
-                    label,
-                )
-                if no_speech_error is None:
-                    no_speech_error = exc
-                continue
-
-            for segment in result.segments:
-                labelled = dict(segment)
-                labelled["speaker"] = label
-                merged.append(labelled)
-            if detected_language is None:
-                detected_language = result.language
-
-        if not merged:
-            if no_speech_error is not None:
-                raise no_speech_error
-            raise NoSpeechError(
-                "No speech was recognized in the recording. Check that the "
-                "microphone and system audio were audible."
-            )
-
-        merged.sort(key=lambda segment: float(segment.get("start", 0.0)))
-        text = "\n".join(
-            f"{segment.get('speaker', '')}: {segment.get('text', '')}"
-            for segment in merged
-        )
-
-        logger.info("Merged track transcription: %s segments.", len(merged))
-        if progress_cb is not None:
-            progress_cb(1.0, "Transcription complete.")
-        return TranscriptionResult(
-            text=text,
-            language=detected_language,
-            segments=merged,
-        )
-
-
 def _normalise_segments(
     segments: list[dict[str, object]] | None,
 ) -> list[dict[str, object]]:
     """Keep only well-formed timestamped segments from a provider.
 
-    A ``speaker`` label, when the provider or the dual-track merge supplied
-    one, is preserved on the normalised segment.
+    A ``speaker`` label, when a provider supplies one, is preserved on the
+    normalised segment.
     """
 
     normalised: list[dict[str, object]] = []
