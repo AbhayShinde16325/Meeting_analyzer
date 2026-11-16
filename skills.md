@@ -1,105 +1,133 @@
 # TeamMeetingAI --- Project Skills
 
 This file defines reusable, project-specific skills for contributors and
-coding agents. These are workflow guides, not external services or
-claims that a particular tool is already installed.
+coding agents. These are workflow guides, not external services or claims
+that a particular tool is already installed.
 
-## Skill 1: Windows Audio Capture
+The project is a **client-server application**: a PySide6 desktop client
+(`ui/`, `client/`, `audio/`) talks HTTP to a FastAPI server (`api/`,
+`services/`, `db/`, `ai/`) with a PostgreSQL database. Keep that boundary in
+mind in every skill below.
+
+## Skill 1: Windows Audio Capture (client)
 
 **Purpose:** Implement and troubleshoot local microphone and Google
-Meet/system-audio capture.
+Meet/system-audio capture on the recording machine.
 
-**Use when:** - Adding microphone recording. - Adding WASAPI loopback
-capture. - Diagnosing missing participant audio. - Handling audio-device
-selection or recording failures.
+**Use when:** Adding or changing recording. Diagnosing missing participant
+audio. Handling device selection or capture failures.
 
-**Inputs:** - Target operating system and version. - Available
-input/output audio devices. - Desired sample rate, channel count, and
-output format. - Whether the user uses headphones, speakers, or an
-external microphone.
+**Workflow:** 1. Enumerate available audio devices (`audio/microphone.py`,
+`audio/system_audio.py`). 2. Identify the microphone input device. 3.
+Identify the active playback device used by Google Meet (WASAPI loopback).
+4. Capture microphone and system output as separate tracks. 5. Finalize WAVs
+safely on stop (`audio/recorder.py`). 6. Verify duration, sample rate
+(48 kHz), channels, and file integrity before upload. 7. Handle unavailable
+devices and capture errors without leaving a false recording state.
 
-**Workflow:** 1. Enumerate available audio devices. 2. Identify the
-microphone input device. 3. Identify the active playback device used by
-Google Meet. 4. Capture microphone and system output separately where
-possible. 5. Save short test recordings. 6. Verify duration, sample
-rate, channels, and file integrity. 7. Play back the test and confirm
-both local and remote voices are audible. 8. Handle unavailable devices
-and capture exceptions without crashing the UI.
+**Rules:** - Do not block the PySide6 main thread. - Provide clear recording
+state and elapsed-time feedback. - Close audio streams and finalize files on
+stop, cancellation, and exceptions. - Avoid hard-coded device indexes. -
+Consider echo and feedback; recommend headphones. - Never claim a recording
+succeeded until the server accepted the upload.
 
-**Implementation guidance:** - Keep device discovery separate from
-recording orchestration. - Do not block the PySide6 main thread. -
-Provide clear recording state and elapsed-time feedback. - Close audio
-streams and finalize files on stop, cancellation, and exceptions. -
-Avoid hard-coded device indexes; device indexes can change. - Consider
-echo and feedback when speakers are used.
+**Acceptance criteria:** Manual start/stop works; both tracks are captured;
+finalized files are valid; errors are visible and recoverable.
 
-**Acceptance criteria:** - User can manually start and stop recording. -
-Microphone audio is captured. - System audio is captured. - Output files
-can be opened and played. - Errors are visible and do not leave the
-application in a false recording state.
+## Skill 2: Recording Upload and Ingestion (client + server)
 
-## Skill 2: Audio File Management
+**Purpose:** Move a finished recording from the client into the server's
+PostgreSQL store and start processing.
 
-**Purpose:** Manage meeting recordings safely on the local device.
+**Use when:** Changing the upload flow (`client/api_client.py`,
+`api/routers/meetings.py`, `services/ingest.py`). Debugging "upload failed"
+or missing audio tracks.
 
-**Use when:** - Creating recording filenames. - Choosing audio
-formats. - Saving or deleting recordings. - Linking files to SQLite
-meeting records.
+**Workflow:** 1. Client finalizes the WAVs in a temp capture directory. 2.
+Client uploads via multipart `POST /meetings` with the host token. 3. The
+API spools the upload to a temp file in bounded chunks. 4.
+`services/ingest.py` stores the original 48 kHz WAV and a derived 16 kHz
+mono WAV as Large Objects and queues a transcription job — in one
+transaction. 5. The client deletes its temp capture directory only after the
+server accepted the upload.
 
-**Workflow:** 1. Generate a unique meeting ID. 2. Create a safe,
-collision-resistant filename. 3. Save under the configured application
-data directory. 4. Finalize the file before marking recording as
-complete. 5. Validate that the file exists and has non-zero size. 6.
-Store a relative path and metadata in SQLite. 7. Handle incomplete
-recordings and cleanup after failures.
+**Rules:** - Mutating endpoints require the host token (`X-Host-Token`); a
+non-host client must get a clear read-only error. - Validate file type, size,
+and attachment constraints server-side; never trust client metadata. - Keep
+ingest atomic; a failed ingest must leave no orphan rows or Large Objects. -
+Record SHA-256 and audio properties in `meeting_files`.
 
-**Rules:** - Do not store large audio BLOBs in SQLite. - Never trust a
-user-supplied path without validation. - Do not overwrite recordings
-with matching names. - Make retention and deletion behavior explicit. -
-Prefer WAV during initial development for easy validation; evaluate
-compressed formats later to reduce disk usage.
+**Acceptance criteria:** Upload → ingest → queued job works end to end;
+failures leave no partial state; non-host uploads are rejected.
 
-**Acceptance criteria:** - Every completed recording has a unique ID and
-valid file. - Database metadata points to the correct file. - Missing
-files are handled gracefully. - Failed or interrupted recordings can be
-identified.
+## Skill 3: PostgreSQL and Large Object Data Management (server)
 
-## Skill 3: Local Speech-to-Text
+**Purpose:** Store and evolve users, meetings, meeting files (audio as Large
+Objects), transcripts, summaries, action items, and processing jobs.
 
-**Purpose:** Transcribe recordings using Faster-Whisper without sending
-audio to a cloud API.
+**Use when:** Creating or changing database models. Implementing queries or
+repositories. Handling schema upgrades. Debugging LO leaks or truncation.
 
-**Use when:** - Integrating transcription. - Selecting Whisper model
-size and compute type. - Processing long recordings. - Improving
-transcription reliability.
+**Workflow:** 1. Define entities in `db/models.py` (SQLAlchemy 2.0). 2.
+Create a new Alembic migration in `db/migrations/versions/` — never edit
+`0001_initial`. 3. Keep audio in Large Objects via `db/lo.py` helpers, never
+`bytea`. 4. Rely on the BEFORE DELETE trigger to unlink LOs with the row. 5.
+Use explicit transaction boundaries; ingest and pipeline mutations must be
+atomic. 6. Test against real PostgreSQL (`TEST_DATABASE_URL`); partial
+indexes, triggers, and LOs do not work on SQLite.
 
-**Workflow:** 1. Verify the audio file is readable. 2. Normalize or
-convert audio if required. 3. Load the configured Faster-Whisper model.
-4. Transcribe with timestamps. 5. Preserve segments and language
-metadata. 6. Save transcript text and segment data. 7. Report progress,
-duration, and failures.
+**Rules:** - The server refuses to start on a missing or newer schema
+(`db/session.py:ensure_schema_current`). - One original and one derived
+audio track per meeting (partial unique indexes enforce this). - Avoid
+sharing one SQLAlchemy session across threads. - Back up before destructive
+operations (`scripts/backup_database.py`). - PostgreSQL runs on the host
+machine only; it is never exposed to the LAN.
 
-**Implementation guidance:** - Keep model loading separate from
-per-meeting processing. - Reuse a loaded model where memory permits. -
-Make model size and CPU/GPU compute type configurable. - Do not assume
-an NVIDIA GPU exists. - Avoid blocking the UI thread. - Preserve
-timestamps for later navigation and evidence.
+**Acceptance criteria:** Schema upgrades are forward-only and guarded;
+deleting a meeting removes all rows and LOs; the scratch-database test tier
+passes.
 
-**Acceptance criteria:** - A known test recording produces a readable
-transcript. - Segment timestamps are retained. - Processing errors are
-surfaced. - Audio remains local.
+## Skill 4: Cloud Transcription with Local Fallback (server)
 
-## Skill 4: Local LLM Meeting Analysis
+**Purpose:** Transcribe the derived 16 kHz track with Sarvam Saaras v4,
+falling back to local Faster-Whisper when Sarvam is unavailable.
 
-**Purpose:** Convert transcripts into structured, evidence-grounded
-meeting notes using Ollama.
+**Use when:** Changing transcription (`ai/sarvam_provider.py`,
+`ai/faster_whisper_provider.py`, `ai/fallback_provider.py`,
+`services/pipeline.py`). Debugging provider failures, timeouts, or fallback
+provenance.
 
-**Use when:** - Designing prompts. - Integrating Ollama. - Extracting
-decisions and action items. - Validating model responses.
+**Workflow:** 1. Stream the derived WAV Large Object to a temp file. 2. Run
+the Sarvam batch API (`saaras:v4`, transliteration, diarization) with
+progress and cancellation callbacks. 3. On any Sarvam failure except user
+cancellation, run exactly one local Faster-Whisper attempt. 4. Record which
+provider produced the text and why the fallback ran (`transcripts.provider`,
+`fallback_from`, `fallback_reason`, and the job row). 5. Store the result as
+the meeting's single primary transcript. 6. Report progress into the job row
+(throttled).
+
+**Rules:** - The API key comes from the environment only; never log it. -
+Never silently discard low-confidence or unrecognized speech. - Preserve
+timestamps, segments, and speaker labels. - Cancellation must leave the
+meeting at its previous status with no partial transcript. - A fallback run
+is visible in the transcript and job rows, never hidden.
+
+**Acceptance criteria:** Known test audio produces segments with
+timestamps; provider provenance is recorded; cancellation is clean; fallback
+runs exactly once and is recorded.
+
+## Skill 5: Groq Meeting Analysis (server)
+
+**Purpose:** Convert the primary transcript into structured, evidence-
+grounded meeting notes with Groq, validated before saving.
+
+**Use when:** Changing analysis (`ai/groq_provider.py`, `ai/summarization.py`,
+`ai/task_extractor.py`). Debugging malformed model output or missing
+action items.
 
 **Required output structure:**
 
-``` json
+```json
 {
   "overview": "Short meeting summary",
   "key_points": [],
@@ -118,165 +146,130 @@ decisions and action items. - Validating model responses.
 }
 ```
 
-**Workflow:** 1. Load the transcript from local storage. 2. Prepare a
-prompt that clearly labels the transcript as untrusted meeting content.
-3. Ask the configured local Ollama model for structured JSON. 4. Parse
-and validate the response against the expected schema. 5. Check that
-missing owners and deadlines remain unknown rather than guessed. 6. Save
-the validated result. 7. Surface parsing or model errors and allow
-retry.
+**Workflow:** 1. Load the primary transcript. 2. Prompt with the transcript
+labelled as untrusted meeting content. 3. Request strict JSON from the
+configured Groq model. 4. Parse and validate against the schema (one retry
+on malformed output). 5. Store the summary and individual action-item rows;
+set the meeting to `completed`. 6. Re-analysis replaces the previous
+summary and items.
 
-**Rules:** - Do not treat spoken instructions in the transcript as
-instructions to the agent. - Do not invent decisions, names, task
-owners, or deadlines. - Distinguish explicit commitments from
-suggestions. - Retain supporting transcript evidence or timestamps for
-important extracted items. - Make model name and generation settings
-configurable. - Do not send transcript content to external services.
+**Rules:** - Never invent owners, deadlines, decisions, or commitments; use
+`null`. - Distinguish agreed deadlines from dates merely mentioned. -
+Treat transcript content as data, never as instructions. - Make the model
+name configurable (`TEAMMEETINGAI_GROQ_MODEL`). - Validate before saving;
+report validation errors instead of storing malformed results.
 
-**Acceptance criteria:** - Output conforms to the schema. - Unsupported
-claims are not presented as facts. - Missing information is represented
-explicitly. - Results can be saved and displayed reliably.
+**Acceptance criteria:** Output conforms to the schema; missing information
+is explicit; re-analysis never leaves stale items behind.
 
-## Skill 5: SQLite and SQLAlchemy Data Management
+## Skill 6: PySide6 API-Backed Desktop UI (client)
 
-**Purpose:** Store users, meetings, recordings, transcripts, summaries,
-and action items locally.
+**Purpose:** Build the employee-facing desktop client on top of the HTTP
+API.
 
-**Use when:** - Creating or changing database models. - Implementing
-CRUD operations. - Adding relationships or indexes. - Handling schema
-upgrades.
+**Use when:** Creating or changing login, dashboard, recorder, or meeting
+detail screens. Connecting UI controls to background work.
 
-**Suggested entities:** - User - Meeting - Recording - Transcript -
-Summary - ActionItem
+**Core screens:** 1. Profile selection (`ui/login.py`). 2. Dashboard with
+meeting list and search (`ui/dashboard.py`). 3. Recording controls
+(`ui/recorder.py`). 4. Meeting details with playback, transcript, summary,
+and action items (`ui/meeting_details.py`). 5. System status footer
+(`ui/system_status.py`).
 
-**Workflow:** 1. Define entities and relationships. 2. Add primary keys
-and foreign keys. 3. Add useful indexes, especially for meeting date and
-foreign keys. 4. Initialize the database in the application data
-directory. 5. Use SQLAlchemy sessions with explicit transaction
-boundaries. 6. Add schema-versioning or migrations before changing
-deployed schemas. 7. Test inserts, reads, updates, deletes, and
-relationship behavior.
+**Workflow:** 1. Build one small screen per responsibility. 2. Route every
+server interaction through `client/api_client.py` — never touch the
+database, files, or audio logic from `ui/`. 3. Run uploads, polling, and
+downloads in worker threads; deliver results via Qt signals. 4. Poll job
+status while transcription/analysis runs; offer cancel. 5. Read
+`GET /system/status` (`can_record`) to enable or disable recording for
+read-only clients.
 
-**Rules:** - Keep large audio files outside SQLite. - Store relative
-recording paths and file metadata. - Use a stable unique meeting ID. -
-Enable SQLite foreign-key enforcement. - Avoid sharing one SQLAlchemy
-session across threads. - Back up the database before destructive
-migrations.
+**Rules:** - Never run uploads, downloads, or polling on the UI thread. -
+Map `ApiClientError`/`ApiConnectionError` to actionable messages. - Require
+explicit user action to start recording; keep the recording state
+unmistakable. - Confirm destructive actions. - Keep cloud-processing
+warnings visible while cloud backends are configured.
 
-**Acceptance criteria:** - Database can be initialized on a clean
-install. - Related records are consistent. - Database failures are
-reported clearly. - Existing user data is not silently overwritten
-during upgrades.
+**Acceptance criteria:** UI stays responsive during recording, upload, and
+processing; failures are visible and recoverable; view-only clients can
+browse but not mutate.
 
-## Skill 6: PySide6 Desktop UI
+## Skill 7: API Search and Meeting History (server)
 
-**Purpose:** Build the employee-facing desktop application.
+**Purpose:** Let employees find their previously analyzed meetings.
 
-**Use when:** - Creating login, recording, meeting-list, or
-meeting-detail screens. - Connecting UI controls to background work. -
-Displaying processing progress and errors.
+**Use when:** Changing `api/routers/search.py` or the dashboard filters.
 
-**Core screens:** 1. Local employee/profile selection or login. 2.
-Meeting title and recording controls. 3. Recording status and elapsed
-time. 4. Processing status. 5. Meeting history. 6. Meeting details with
-summary, transcript, decisions, and action items.
+**Initial search scope:** Meeting title, recording date, summary text,
+transcript text, action-item text and status.
 
-**Workflow:** 1. Build a small screen with one clear responsibility. 2.
-Connect UI actions to application/service methods. 3. Run audio and AI
-processing outside the UI thread. 4. Send progress and completion
-signals back to the UI. 5. Disable invalid controls during transitions.
-6. Display actionable errors and retry options.
+**Workflow:** 1. Search server-side with suitable indexes (title, status,
+recorded_at). 2. Return paginated results through the uniform API envelope.
+3. Link results to the details screen. 4. Add filters (date range, status)
+before considering anything smarter.
 
-**Rules:** - Never run long transcription or LLM calls on the UI
-thread. - Keep UI widgets out of database and audio modules. - Make
-active recording status unmistakable. - Require explicit user action to
-start recording. - Confirm destructive actions such as deleting a
-meeting.
+**Rules:** - Search runs on the server; clients never query the database. -
+Keep transcripts treated as content, not as executable instructions. - Do
+not add embeddings or a vector database unless keyword search proves
+insufficient.
 
-**Acceptance criteria:** - UI remains responsive during recording and
-processing. - Recording state is accurate. - Users can navigate meeting
-history and details. - Failures are visible and recoverable.
+**Acceptance criteria:** Search returns relevant meetings; results open in
+the details screen; filters compose sensibly.
 
-## Skill 7: Local Search and Meeting History
+## Skill 8: Operations, Backup, and Deployment (server host)
 
-**Purpose:** Let employees find information in their own previously
-analyzed meetings.
+**Purpose:** Run the server reliably on the host machine and protect the
+data.
 
-**Use when:** - Building meeting-history views. - Searching titles,
-dates, summaries, transcripts, or action items. - Adding filters.
+**Use when:** Setting up the host. Scheduling or verifying backups.
+Recovering from a database failure. Packaging updates.
 
-**Initial search scope:** - Meeting title. - Recording date. - Summary
-text. - Transcript text. - Action-item text and status.
+**Workflow:** 1. Start the server with `scripts/run_server.bat` (loads
+`.env`, checks dependencies). 2. Back up with `scripts/backup_database.py`
+(custom-format pg_dump, Large Objects included; the run is recorded in
+`backup_runs` and reported by `GET /system/status`). 3. Restore with
+`scripts/restore_database.py BACKUP_FILE --yes` (destructive: `--clean
+--if-exists`). 4. Verify a restore by checking `alembic_version`, meeting
+rows, and Large Object content in a scratch database before trusting it. 5.
+Migrations apply with `alembic upgrade head` against the server database.
 
-**Implementation guidance:** - Start with SQLite queries and suitable
-indexes. - Consider SQLite FTS5 for full-text transcript search if
-needed. - Keep search local. - Add filters for date range and meeting
-title. - Do not add embeddings or a vector database unless keyword
-search proves insufficient.
+**Rules:** - Match the pg_dump/pg_restore client major version to the server
+when multiple versions are installed. - Keep backups on a separate volume
+from the database where possible. - Never commit `.env`, backups, or logs. -
+The database URL and API keys live in `.env` only.
 
-**Acceptance criteria:** - Search returns relevant local meetings. -
-Results link to meeting details. - Search remains usable with a growing
-local meeting history.
-
-## Skill 8: Packaging and Local Deployment
-
-**Purpose:** Package the application for installation on each employee's
-computer.
-
-**Use when:** - Creating Windows executables. - Preparing installation
-instructions. - Managing model downloads and local application data.
-
-**Workflow:** 1. Confirm the application runs from source in a clean
-virtual environment. 2. Separate application code from user data and
-model files. 3. Build with PyInstaller. 4. Test on a machine without the
-development environment. 5. Verify audio-device permissions and
-dependencies. 6. Document how to install or select Ollama models and
-Faster-Whisper models. 7. Verify that recordings and the SQLite database
-are stored in the intended local data directory.
-
-**Rules:** - Do not bundle multi-gigabyte AI models into the executable
-by default. - Explain first-run model downloads and disk requirements. -
-Do not store user data inside a temporary PyInstaller directory. - Keep
-configuration and data paths stable across application updates. -
-Provide a backup and restore procedure.
-
-**Acceptance criteria:** - Application starts on a clean target Windows
-machine. - Required local dependencies are documented. - User data
-survives application upgrades. - No cloud account or API key is required
-for the local workflow.
+**Acceptance criteria:** A backup restores into a scratch database with all
+meetings and audio intact; `backup_runs` reflects every attempt, including
+failures.
 
 ## Skill 9: Testing and Debugging
 
 **Purpose:** Diagnose issues systematically and prevent regressions.
 
-**Use when:** - Debugging audio capture. - Investigating transcription
-or summarization failures. - Fixing database or UI problems. - Preparing
-a release.
+**Use when:** Debugging capture, upload, transcription, analysis, or UI
+problems. Preparing a release.
 
 **Workflow:** 1. Reproduce the issue with the smallest test case. 2.
-Identify the failing layer: UI, audio, file storage, transcription, LLM,
-or database. 3. Inspect logs and error messages without exposing meeting
-content. 4. State the root cause before applying a fix. 5. Make a
-focused change. 6. Add a regression test or repeatable manual test. 7.
-Verify the complete workflow after the fix.
+Identify the failing layer: UI, client, API, service, database, provider, or
+audio. 3. Inspect logs without exposing meeting content, tokens, or keys. 4.
+State the root cause before applying a fix. 5. Make a focused change. 6.
+Add a regression test or repeatable manual test. 7. Run the suite, with
+`TEST_DATABASE_URL` set for server/database changes. 8. Verify the complete
+workflow after the fix.
 
-**Acceptance criteria:** - The issue can be reproduced or its limits are
-documented. - The fix addresses the root cause. - Relevant tests pass. -
-Remaining limitations are reported honestly.
+**Acceptance criteria:** The issue is reproduced or its limits documented;
+the fix addresses the root cause; relevant tests pass; remaining
+limitations are reported honestly.
 
 ## Current Skill Priority
 
-For the first MVP, use these skills in this order:
+The core client-server pipeline is implemented and tested (229 tests passing
+including the PostgreSQL tier). Current priorities, in order:
 
-1.  Windows Audio Capture.
-2.  Audio File Management.
-3.  SQLite and SQLAlchemy Data Management.
-4.  Local Speech-to-Text.
-5.  Local LLM Meeting Analysis.
-6.  PySide6 Desktop UI.
-7.  Local Search and Meeting History.
-8.  Packaging and Local Deployment.
-9.  Testing and Debugging throughout development.
-
-Do not build a central server, shared database, remote synchronization,
-or cloud processing as part of this V1.
+1.  Restore the operational environment: PostgreSQL for the server and
+    scheduled backups (Skill 8).
+2.  Manual desktop UI verification on the host machine (Skills 1, 2, 6).
+3.  Legacy SQLite/filesystem data migration into PostgreSQL (Skills 3 and
+    the old `storage/` code as reference only).
+4.  Documentation and cleanup of dead legacy code (Skill 9 discipline;
+    nothing gets deleted before migration and backups are verified).
