@@ -17,6 +17,7 @@ audio itself always stays in Large Objects (see ``db/models.py``).
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 from dataclasses import dataclass
@@ -86,13 +87,11 @@ class VoiceEncoderAdapter:
     model_name = "ge2e-256"
 
     def __init__(self) -> None:
-        try:
-            from resemblyzer import VoiceEncoder, preprocess_wav
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise SpeakerProfilingError(
-                "Voice profiling requires the optional 'resemblyzer' package. "
-                "Install it with: pip install resemblyzer"
-            ) from exc
+        problem = encoder_import_error()
+        if problem:
+            raise SpeakerProfilingError(problem)
+        from resemblyzer import VoiceEncoder, preprocess_wav
+
         self._preprocess_wav = preprocess_wav
         self._encoder = VoiceEncoder(verbose=False)
 
@@ -120,12 +119,51 @@ class VoiceEncoderAdapter:
         )
 
 
+def encoder_import_error() -> str | None:
+    """Actionable message when the encoder cannot be imported, else None.
+
+    Actually imports ``resemblyzer`` (a ``find_spec`` check is not enough:
+    the package can be present while a broken dependency makes the import
+    fail, e.g. ``pkg_resources`` missing from setuptools >= 81).  A
+    successful import is cached by Python itself, so the torch import cost
+    is only paid once per process.
+    """
+
+    try:
+        importlib.import_module("resemblyzer")
+    except ImportError as exc:
+        reason = str(exc)
+        if "No module named 'resemblyzer'" in reason or reason.endswith(
+            "resemblyzer"
+        ):
+            return (
+                "Voice profiling is unavailable: the optional 'resemblyzer' "
+                "package is not installed. Install it with: "
+                "pip install resemblyzer"
+            )
+        if "pkg_resources" in reason:
+            return (
+                "Voice profiling is unavailable: the 'resemblyzer' package "
+                "is installed but cannot import 'pkg_resources'. Fix with: "
+                ".venv\\Scripts\\python.exe -m pip install \"setuptools<81\""
+            )
+        return (
+            "Voice profiling is unavailable: the 'resemblyzer' package is "
+            f"installed but cannot be imported ({reason}). Reinstall with: "
+            "pip install --force-reinstall resemblyzer"
+        )
+    except Exception as exc:  # broken optional dependency of resemblyzer
+        return (
+            "Voice profiling is unavailable: importing 'resemblyzer' failed "
+            f"({type(exc).__name__}: {exc})."
+        )
+    return None
+
+
 def is_encoder_available() -> bool:
-    """Whether the optional resemblyzer package is importable."""
+    """Whether the voice encoder can actually be imported right now."""
 
-    import importlib.util
-
-    return importlib.util.find_spec("resemblyzer") is not None
+    return encoder_import_error() is None
 
 
 def get_encoder() -> VoiceEncoderAdapter:
@@ -422,6 +460,18 @@ class SpeakerProfileService:
         profile_names = {str(p["id"]): str(p["display_name"]) for p in profiles}
         centroids = self._profile_centroids()
 
+        # Same-voice detection: two auto-detected labels whose voice prints
+        # are near-identical are the same person split by diarization.  This
+        # is a *suggestion* only — merging happens when the user assigns
+        # both labels to the same profile.
+        same_voice = self._same_voice_map(
+            {
+                label: list(row["embedding"])
+                for label, row in embeddings.items()
+                if row["embedding"] is not None
+            }
+        )
+
         speakers: list[dict[str, Any]] = []
         for label in sorted(labels):
             stats = labels[label]
@@ -473,9 +523,35 @@ class SpeakerProfileService:
                         else None
                     ),
                     "candidates": candidates,
+                    "same_voice_labels": same_voice.get(label, []),
                 }
             )
         return speakers
+
+    def _same_voice_map(
+        self, label_embeddings: dict[str, list[float]]
+    ) -> dict[str, list[str]]:
+        """Pair labels whose voice prints are near-identical.
+
+        Returns, per label, the other labels whose embeddings score at or
+        above ``voice_merge_threshold``, best match first.
+        """
+
+        threshold = self._settings.voice_merge_threshold
+        labels = sorted(label_embeddings)
+        same_voice: dict[str, list[tuple[float, str]]] = {}
+        for index, label in enumerate(labels):
+            for other in labels[index + 1 :]:
+                score = cosine_similarity(
+                    label_embeddings[label], label_embeddings[other]
+                )
+                if score >= threshold:
+                    same_voice.setdefault(label, []).append((score, other))
+                    same_voice.setdefault(other, []).append((score, label))
+        return {
+            label: [other for _, other in sorted(pairs, reverse=True)]
+            for label, pairs in same_voice.items()
+        }
 
     def assign_speaker(
         self,

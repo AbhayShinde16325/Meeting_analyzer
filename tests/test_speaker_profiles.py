@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import importlib
+
 import numpy as np
 import pytest
 
+from services import speaker_profiles as sp
 from services.speaker_profiles import (
     LabelEmbedding,
     SpeakerProfilingError,
     cosine_similarity,
     embeddings_from_wav,
+    encoder_import_error,
     mean_embedding,
 )
 
@@ -154,3 +158,65 @@ def test_label_embedding_is_frozen():
     embedding = LabelEmbedding(local_label="S", embedding=[1.0], source_seconds=1.0)
     with pytest.raises(Exception):
         embedding.local_label = "T"  # type: ignore[misc]
+
+
+class TestDependencyDetection:
+    """The availability check must catch broken imports, not just find_spec."""
+
+    def test_missing_package_message_names_install_command(self, monkeypatch):
+        def fail(name):
+            if name == "resemblyzer":
+                raise ImportError("No module named 'resemblyzer'")
+            return importlib.import_module(name)
+
+        monkeypatch.setattr(sp.importlib, "import_module", fail)
+        message = encoder_import_error()
+        assert message is not None
+        assert "pip install resemblyzer" in message
+
+    def test_broken_dependency_message_names_the_fix(self, monkeypatch):
+        def fail(name):
+            if name == "resemblyzer":
+                raise ImportError("No module named 'pkg_resources'")
+            return importlib.import_module(name)
+
+        monkeypatch.setattr(sp.importlib, "import_module", fail)
+        message = encoder_import_error()
+        assert message is not None
+        assert "pkg_resources" in message
+        assert "setuptools<81" in message
+
+    def test_broken_non_dependency_error_is_reported(self, monkeypatch):
+        def fail(name):
+            if name == "resemblyzer":
+                raise RuntimeError("cuda exploded")
+            return importlib.import_module(name)
+
+        monkeypatch.setattr(sp.importlib, "import_module", fail)
+        message = encoder_import_error()
+        assert message is not None
+        assert "cuda exploded" in message
+
+    def test_successful_import_reports_no_problem(self, monkeypatch):
+        monkeypatch.setattr(
+            sp.importlib,
+            "import_module",
+            lambda name: importlib.import_module(name),
+        )
+        # In the test environment resemblyzer may be absent; both outcomes
+        # are valid, the contract is only that no exception escapes.
+        result = encoder_import_error()
+        assert result is None or "resemblyzer" in result
+
+    def test_is_encoder_available_follows_import_error(self, monkeypatch):
+        monkeypatch.setattr(sp, "encoder_import_error", lambda: None)
+        assert sp.is_encoder_available() is True
+        monkeypatch.setattr(sp, "encoder_import_error", lambda: "broken")
+        assert sp.is_encoder_available() is False
+
+    def test_encoder_adapter_raises_actionable_error(self, monkeypatch):
+        monkeypatch.setattr(
+            sp, "encoder_import_error", lambda: "fix me: setuptools<81"
+        )
+        with pytest.raises(SpeakerProfilingError, match="setuptools<81"):
+            sp.get_encoder()

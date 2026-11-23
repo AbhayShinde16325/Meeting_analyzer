@@ -435,6 +435,41 @@ class SpeakerAssignment(Base):
     )
 
 
+class TranscriptMetrics(Base):
+    """Reference-free quality metrics for one transcription run.
+
+    Computed automatically after a transcription succeeds from the stored
+    segments (speech coverage, timestamp ordering, duplication, speaker
+    count, job latency).  Reference-based accuracy (WER and friends) is
+    deliberately absent: there is no ground-truth transcript for real
+    meetings, so none of those numbers are ever fabricated here.
+    """
+
+    __tablename__ = "transcript_metrics"
+    __table_args__ = (
+        Index(
+            "uq_transcript_metrics_transcript",
+            "transcript_id",
+            unique=True,
+        ),
+        Index("ix_transcript_metrics_meeting_id", "meeting_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    transcript_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("transcripts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    computed_at: Mapped[datetime] = _created_at()
+
+
 class BackupRun(Base):
     """Record of one ``pg_dump`` backup execution for status monitoring."""
 

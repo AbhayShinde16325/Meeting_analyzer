@@ -130,6 +130,7 @@ class _DetailsWorker(QThread):
                 "action_items": self.client.list_action_items(self.meeting_id),
                 "jobs": self.client.list_jobs(self.meeting_id),
                 "speakers": self.client.list_meeting_speakers(self.meeting_id),
+                "metrics": self.client.get_meeting_metrics(self.meeting_id),
             }
         except (ApiClientError, ApiConnectionError) as exc:
             self.completed.emit(None, str(exc))
@@ -397,6 +398,13 @@ class MeetingDetailsScreen(QWidget):
         self.transcript_browser.setObjectName("detailBrowser")
         self.tabs.addTab(self.transcript_browser, "Transcript")
 
+        # Metrics tab: reference-free quality metrics computed by the server
+        # after each transcription.
+        self.metrics_browser = QTextBrowser()
+        self.metrics_browser.setOpenExternalLinks(False)
+        self.metrics_browser.setObjectName("detailBrowser")
+        self.tabs.addTab(self.metrics_browser, "Metrics")
+
         # Attachments tab: documents stored with the meeting.
         attachments_widget = QWidget()
         attachments_layout = QVBoxLayout(attachments_widget)
@@ -522,6 +530,7 @@ class MeetingDetailsScreen(QWidget):
 
         self._render_overview(details)
         self._render_transcript(details)
+        self._render_metrics(details)
         self._render_actions(details)
         self._render_attachments(details)
         self._update_controls()
@@ -682,6 +691,86 @@ class MeetingDetailsScreen(QWidget):
             text = html.escape(str(transcript.get("text", ""))).replace("\n", "<br>")
             parts.append(f"<p>{text}</p>")
         self.transcript_browser.setHtml(self._wrap_html("".join(parts)))
+
+    def _render_metrics(self, details: dict[str, Any]) -> None:
+        """Render the eight post-transcription metrics, measured from the
+        current transcription run."""
+
+        row = details.get("metrics")
+        if not row or not row.get("metrics"):
+            self.metrics_browser.setHtml(
+                self._wrap_html(
+                    "<h2>Metrics</h2>"
+                    "<p class='muted'>No quality metrics are available for "
+                    "this meeting yet. They are computed automatically after "
+                    "a transcription completes; re-transcribe the meeting to "
+                    "generate them.</p>"
+                )
+            )
+            return
+
+        metrics = row["metrics"]
+
+        def seconds(value: Any) -> str:
+            if value is None:
+                return "-"
+            return f"{float(value):.1f}s"
+
+        def percent(value: Any) -> str:
+            if value is None:
+                return "-"
+            return f"{float(value):.1f}%"
+
+        status = str(metrics.get("transcription_status") or "unknown").title()
+        status_html = html.escape(status)
+        error = metrics.get("error")
+        if error:
+            status_html += (
+                f"<br><span style='color:#b42318'>"
+                f"{html.escape(str(error))}</span>"
+            )
+        fallback_from = metrics.get("fallback_from")
+        if fallback_from:
+            status_html += html.escape(
+                f" (via {fallback_from} fallback)"
+            )
+
+        rows: list[tuple[str, str]] = [
+            ("Audio duration", seconds(metrics.get("audio_duration_s"))),
+            (
+                "Transcription duration",
+                seconds(metrics.get("transcription_duration_s")),
+            ),
+            ("Real-time factor (RTF)", str(metrics.get("rtf") or "-")),
+            (
+                "Speakers detected",
+                str(metrics.get("num_speakers") or "-"),
+            ),
+            ("Speaker-labelled speech", percent(metrics.get("labelled_speech_pct"))),
+            ("Unknown-speaker speech", percent(metrics.get("unknown_speech_pct"))),
+            ("Segments needing review", str(metrics.get("review_segments", "-"))),
+            ("Transcription status", status_html),
+        ]
+
+        body = [
+            "<h2>Transcript metrics</h2>",
+            "<p class='muted'>Measured from the current transcription run. "
+            "Speaker percentages are computed from speech duration, not "
+            "segment counts.</p>",
+            "<table>",
+        ]
+        for label, value in rows:
+            body.append(
+                f"<tr><td><b>{html.escape(label)}:</b></td>"
+                f"<td>{value}</td></tr>"
+            )
+        body.append("</table>")
+        computed = row.get("computed_at")
+        if computed:
+            body.append(
+                f"<p class='muted'>Computed {html.escape(_format_datetime(computed))}.</p>"
+            )
+        self.metrics_browser.setHtml(self._wrap_html("".join(body)))
 
     def _render_actions(self, details: dict[str, Any]) -> None:
         items = details.get("action_items") or []

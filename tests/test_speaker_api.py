@@ -33,6 +33,7 @@ class _FakeEncoder:
         "spk-a": [1.0, 0.0, 0.0],
         "spk-b": [0.0, 1.0, 0.0],
         "spk-c": [0.72, 0.72, 0.0],  # cosine 0.71 vs spk-a: candidate only
+        "spk-dup": [1.0, 0.0, 0.0],  # identical to spk-a: same voice
     }
 
     def compute_label_embeddings(
@@ -289,6 +290,96 @@ class TestProfilingJob:
         assert response.json()["error"]["code"] == "profiling_disabled"
 
 
+class TestAutomaticChaining:
+    def test_transcription_chains_profiling_automatically(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        """Running the transcription job chains profiling automatically."""
+
+        api, meeting_id = host_and_meeting
+        # Ingest already queued a transcription job — the exact job the UI's
+        # Re-transcribe button re-runs.
+        jobs = api.get(f"/meetings/{meeting_id}/jobs").json()
+        transcription_job_id = next(
+            j["id"]
+            for j in jobs
+            if j["job_type"] == "transcription" and j["status"] == "queued"
+        )
+
+        # The transcription fake has no diarized segments, so profiling
+        # succeeds with an explanatory message — the point is that the
+        # profiling job is enqueued and runs without any manual action.
+        api.app.state.pipeline.run_job(transcription_job_id)
+
+        jobs = api.get(f"/meetings/{meeting_id}/jobs").json()
+        profiling_jobs = [j for j in jobs if j["job_type"] == "profiling"]
+        assert profiling_jobs, "transcription must enqueue a profiling job"
+        assert profiling_jobs[0]["status"] == "succeeded"
+        assert "No diarized speakers" in profiling_jobs[0]["message"]
+
+    def test_profiling_failure_does_not_fail_transcription(
+        self, speaker_api, pg_engine, host_and_meeting, monkeypatch
+    ):
+        """A broken encoder fails only the profiling job, with a clear error."""
+
+        from ai.transcription import TranscriptionResult
+        from services.speaker_profiles import SpeakerProfilingError
+
+        api, meeting_id = host_and_meeting
+        jobs = api.get(f"/meetings/{meeting_id}/jobs").json()
+        transcription_job_id = next(
+            j["id"]
+            for j in jobs
+            if j["job_type"] == "transcription" and j["status"] == "queued"
+        )
+
+        # Make the fake transcription produce diarized segments so the chain
+        # reaches the (broken) encoder.
+        pipeline = api.app.state.pipeline
+        service = pipeline._transcription_service
+
+        def diarized_transcribe(audio_path, **kwargs):
+            return TranscriptionResult(
+                text="diarized text",
+                language="en",
+                segments=[
+                    {"start": 0.0, "end": 5.0, "text": "hello",
+                     "speaker": "spk-a"},
+                ],
+            )
+
+        monkeypatch.setattr(service, "transcribe", diarized_transcribe)
+
+        class _BrokenEncoder:
+            provider_name = "fake"
+            model_name = "fake-256"
+
+            def compute_label_embeddings(self, *args, **kwargs):
+                raise SpeakerProfilingError(
+                    "Voice profiling is unavailable: the 'resemblyzer' "
+                    "package is installed but cannot import 'pkg_resources'. "
+                    "Fix with: .venv\\Scripts\\python.exe -m pip install "
+                    "\"setuptools<81\""
+                )
+
+        # Instance-attribute patch: monkeypatch restores the module-scoped
+        # fake encoder after the test.
+        monkeypatch.setattr(
+            pipeline._speaker_profiler, "_encoder", _BrokenEncoder()
+        )
+        api.app.state.pipeline.run_job(transcription_job_id)
+
+        jobs = api.get(f"/meetings/{meeting_id}/jobs").json()
+        transcription_job = next(
+            j for j in jobs if j["id"] == transcription_job_id
+        )
+        assert transcription_job["status"] == "succeeded"
+        profiling_jobs = [j for j in jobs if j["job_type"] == "profiling"]
+        assert profiling_jobs
+        assert profiling_jobs[0]["status"] == "failed"
+        assert "setuptools<81" in profiling_jobs[0]["error"]
+
+
 class TestMatchingAndReview:
     def test_confirm_creates_profile_and_suggests_next_meeting(
         self, speaker_api, pg_engine, host_and_meeting
@@ -366,6 +457,39 @@ class TestMatchingAndReview:
             json={"status": "confirmed"},
         )
         assert response.status_code == 400
+
+    def test_same_voice_labels_detect_split_speakers(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        """Two labels with the same voice print are flagged as one person."""
+
+        api, meeting_id = host_and_meeting
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "hello", "speaker": "spk-a"},
+            {"start": 5.0, "end": 10.0, "text": "echo of the same voice",
+             "speaker": "spk-dup"},
+            {"start": 10.0, "end": 15.0, "text": "different voice",
+             "speaker": "spk-b"},
+        ]
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                    "is_primary, text, segments) VALUES (gen_random_uuid(), :m, "
+                    "'fake', 'fake-model', true, 'split diarization', "
+                    "CAST(:segments AS jsonb))"
+                ),
+                {"m": meeting_id, "segments": json.dumps(segments)},
+            )
+        _run_profiling_job(api, meeting_id)
+
+        spk_a = _speaker_by_label(api, meeting_id, "spk-a")
+        spk_dup = _speaker_by_label(api, meeting_id, "spk-dup")
+        assert spk_a["same_voice_labels"] == ["spk-dup"]
+        assert spk_dup["same_voice_labels"] == ["spk-a"]
+        # A genuinely different voice is never flagged.
+        spk_b = _speaker_by_label(api, meeting_id, "spk-b")
+        assert spk_b["same_voice_labels"] == []
 
     def test_assign_unknown_label_is_404(self, speaker_api, pg_engine, host_and_meeting):
         """A label that is not in the transcript is a client error (404)."""

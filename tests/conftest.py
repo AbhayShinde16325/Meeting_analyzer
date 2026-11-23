@@ -27,6 +27,18 @@ for path in (str(PROJECT_ROOT), str(TESTS_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+# Load TEST_DATABASE_URL from the project .env once per pytest session, so
+# the PostgreSQL tier runs without per-shell environment setup.  A
+# TEST_DATABASE_URL already present in the environment always wins, and the
+# value is never printed.
+if not os.environ.get("TEST_DATABASE_URL"):
+    _env_file = PROJECT_ROOT / ".env"
+    if _env_file.is_file():
+        for _line in _env_file.read_text(encoding="utf-8").splitlines():
+            if _line.startswith("DATABASE_URL="):
+                os.environ["TEST_DATABASE_URL"] = _line.split("=", 1)[1].strip()
+                break
+
 import pytest  # noqa: E402
 
 from config import ensure_directories, load_settings  # noqa: E402

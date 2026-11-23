@@ -144,8 +144,36 @@ transcription and may attach **suggestions** to known speaker profiles.
   create a new profile, reject a speaker ("not tracked"), reset to the
   suggestion, and rename profiles. Confirmations feed future matching;
   rejections survive re-profiling.
+- If diarization splits one person into several labels, the review dialog
+  flags the labels that share a near-identical voice print ("same voice
+  as ..."); assigning them to the same profile merges them in the
+  transcript.
 - Embeddings and matches are computed locally (Resemblyzer, CPU); no voice
   data is sent anywhere.
+
+### Transcript metrics (automatic)
+
+Every successful transcription computes eight **measured metrics** from the
+stored transcript — shown in the meeting's **Metrics** tab:
+
+1. **Audio duration** — from the stored recording.
+2. **Transcription duration** — wall-clock time of the transcription job.
+3. **Real-time factor (RTF)** — transcription duration / audio duration
+   (omitted when either is missing or the audio duration is zero).
+4. **Speakers detected** — distinct diarization labels.
+5. **Speaker-labelled speech** — share of transcribed speech duration with a
+   speaker label.
+6. **Unknown-speaker speech** — share of transcribed speech duration without
+   a label; the two percentages derive from segment *durations*, not counts.
+7. **Segments needing review** — segments with no speaker label or invalid
+   timestamps; no confidence is fabricated.
+8. **Transcription status / errors** — job outcome, including Whisper
+   fallback information.
+
+Metrics are computed on the server inside the transcription job and stored
+per transcription run (`transcript_metrics` table); re-transcribing replaces
+them. If computation fails, transcription still succeeds and the tab shows
+an explanatory empty state.
 
 ## Backups
 
@@ -171,6 +199,7 @@ variables; real variables win). Server-only variables:
 | `DATABASE_URL` | `postgresql+psycopg://localhost/teammeetingai` | Server database (also `TEAMMEETINGAI_DATABASE_URL`) |
 | `TEAMMEETINGAI_SARVAM_API_KEY` | blank | Sarvam transcription key |
 | `TEAMMEETINGAI_SARVAM_LANGUAGE_HINT` | blank | Optional BCP-47 language hint (e.g. `hi-IN`) sent to Sarvam; blank auto-detects |
+| `TEAMMEETINGAI_SARVAM_NUM_SPEAKERS` | blank | Optional speaker count for diarization (e.g. `3`) when auto-detection over-splits speakers |
 | `TEAMMEETINGAI_HOST_TOKEN` | blank | Shared host secret for mutating endpoints |
 | `TEAMMEETINGAI_ANALYSIS_BACKEND` | `none` | `groq` enables analysis |
 | `TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS` | unset | Must be `1` to enable cloud analysis |
@@ -182,6 +211,7 @@ variables; real variables win). Server-only variables:
 | `TEAMMEETINGAI_VOICE_REVIEW_THRESHOLD` | `0.70` | Cosine similarity for a manual candidate in the review UI |
 | `TEAMMEETINGAI_VOICE_MIN_SEGMENT_SECONDS` | `3` | Minimum speech per speaker to compute a voice print |
 | `TEAMMEETINGAI_VOICE_MAX_SEGMENTS_PER_SPEAKER` | `20` | Segments used per speaker when embedding |
+| `TEAMMEETINGAI_VOICE_MERGE_THRESHOLD` | `0.90` | Cosine similarity at which two labels in a meeting are flagged as the same voice (merge suggestion) |
 
 Client and transcription-fallback variables:
 

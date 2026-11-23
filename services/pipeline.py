@@ -39,6 +39,7 @@ from ai.transcription import (
 )
 from db import lo
 from services.speaker_profiles import SpeakerProfileService, SpeakerProfilingError
+from services.transcript_metrics import compute_transcript_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,43 @@ class TranscriptionPipeline:
                     "segments": _segments_json(result.segments),
                 },
             ).scalar_one()
+            # Post-transcription metrics: computed from the stored transcript
+            # and the job's own timing, persisted per run.  Re-transcription
+            # replaces the previous metrics (one row per transcript).  A
+            # metrics failure must never fail transcription.
+            try:
+                metrics = compute_transcript_metrics(
+                    segments=list(result.segments or []),
+                    audio_duration_s=duration / 1000.0 if duration else None,
+                    transcription_duration_s=self._job_latency_seconds(
+                        job_id, conn
+                    ),
+                    transcription_status="succeeded",
+                    error=None,
+                    fallback_from=fallback_from,
+                    fallback_reason=fallback_reason,
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO transcript_metrics (id, meeting_id, "
+                        "transcript_id, metrics) VALUES (gen_random_uuid(), :m, "
+                        ":t, CAST(:metrics AS jsonb)) "
+                        "ON CONFLICT (transcript_id) DO UPDATE SET "
+                        "metrics = EXCLUDED.metrics, computed_at = now()"
+                    ),
+                    {
+                        "m": meeting_id,
+                        "t": transcript_id,
+                        "metrics": _json(metrics),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Post-transcription metrics computation failed for "
+                    "meeting %s; continuing without metrics.",
+                    meeting_id,
+                    exc_info=True,
+                )
             conn.execute(
                 text(
                     "UPDATE meetings SET status = 'transcribed', language = "
@@ -240,6 +278,18 @@ class TranscriptionPipeline:
                 self.run_job(profiling_job_id)
             except Exception:
                 logger.exception("Chained profiling failed after transcription.")
+
+    def _job_latency_seconds(self, job_id: str, conn: Connection) -> float | None:
+        """Seconds since the job started running (measured, not estimated)."""
+
+        value = conn.execute(
+            text(
+                "SELECT EXTRACT(EPOCH FROM (now() - started_at)) "
+                "FROM processing_jobs WHERE id = :id AND started_at IS NOT NULL"
+            ),
+            {"id": job_id},
+        ).scalar()
+        return float(value) if value is not None else None
 
     def _enqueue_analysis(self, meeting_id: str) -> str:
         with self._engine.begin() as conn:

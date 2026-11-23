@@ -178,6 +178,12 @@ class Settings:
     # "en-IN").  Empty means auto-detect, which is the default behaviour.
     sarvam_language_hint: str = ""
 
+    # Optional speaker-count hint for Sarvam diarization
+    # (TEAMMEETINGAI_SARVAM_NUM_SPEAKERS).  0 means auto.  Set this when
+    # diarization splits one person into several labels (e.g. 3 real
+    # speakers reported as 5).
+    sarvam_num_speakers: int = 0
+
     # Voice profiling V1.  Requires the optional 'resemblyzer' package;
     # without the flag (or the package) the pipeline behaves exactly as
     # before and no voice embeddings are computed.  Matching never assigns
@@ -195,6 +201,10 @@ class Settings:
     voice_min_segment_seconds: float = 3.0
     # Upper bound on transcript segments used per speaker label.
     voice_max_segments_per_speaker: int = 20
+    # Cosine similarity at or above which two diarized labels in the same
+    # meeting are reported as the same voice (a merge suggestion in the
+    # review UI; the user confirms the merge, it is never applied alone).
+    voice_merge_threshold: float = 0.90
 
     # Local LLM (Ollama).  Reserved for a future local analysis backend.
     ollama_host: str = "http://localhost:11434"
@@ -291,6 +301,7 @@ def load_settings() -> Settings:
         sarvam_language_hint=os.environ.get(
             "TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", ""
         ).strip(),
+        sarvam_num_speakers=_int_env("TEAMMEETINGAI_SARVAM_NUM_SPEAKERS", 0),
         voice_profiling_enabled=_bool_env("TEAMMEETINGAI_VOICE_PROFILING"),
         voice_match_threshold=_float_env(
             "TEAMMEETINGAI_VOICE_MATCH_THRESHOLD", 0.80
@@ -303,6 +314,9 @@ def load_settings() -> Settings:
         ),
         voice_max_segments_per_speaker=_int_env(
             "TEAMMEETINGAI_VOICE_MAX_SEGMENTS_PER_SPEAKER", 20
+        ),
+        voice_merge_threshold=_float_env(
+            "TEAMMEETINGAI_VOICE_MERGE_THRESHOLD", 0.90
         ),
         ollama_host=os.environ.get(
             "TEAMMEETINGAI_OLLAMA_HOST", "http://localhost:11434"

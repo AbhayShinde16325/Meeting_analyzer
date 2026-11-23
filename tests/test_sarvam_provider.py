@@ -114,6 +114,27 @@ class TestConfiguration:
         provider.transcribe(audio)
         assert client.calls[0]["language_code"] == "hi-IN"
 
+    def test_num_speakers_hint_is_sent_when_configured(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEAMMEETINGAI_SARVAM_NUM_SPEAKERS", "3")
+        monkeypatch.setenv("TEAMMEETINGAI_DATA_DIR", str(tmp_path))
+        settings = load_settings()
+        client = FakeClient(FakeJob())
+        provider = SarvamTranscriptionProvider(settings, client=client, poll_interval=0.01)
+        audio = tmp_path / "audio.wav"
+        audio.write_bytes(b"RIFF....")
+        provider.transcribe(audio)
+        assert client.calls[0]["num_speakers"] == 3
+
+    def test_num_speakers_omitted_without_hint(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TEAMMEETINGAI_SARVAM_NUM_SPEAKERS", raising=False)
+        settings = make_settings(tmp_path, monkeypatch)
+        client = FakeClient(FakeJob())
+        provider = SarvamTranscriptionProvider(settings, client=client, poll_interval=0.01)
+        audio = tmp_path / "audio.wav"
+        audio.write_bytes(b"RIFF....")
+        provider.transcribe(audio)
+        assert "num_speakers" not in client.calls[0]
+
     def test_no_language_code_is_sent_without_hint(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", raising=False)
         settings = make_settings(tmp_path, monkeypatch)

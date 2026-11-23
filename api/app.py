@@ -28,6 +28,7 @@ from api.routers import (
     health,
     jobs,
     meetings,
+    metrics,
     search,
     speakers,
     summaries,
@@ -75,6 +76,7 @@ def build_app() -> FastAPI:
     app.include_router(summaries.action_router)
     app.include_router(jobs.router)
     app.include_router(search.router)
+    app.include_router(metrics.router)
     app.include_router(speakers.router)
     app.include_router(speakers.profiles_router)
     app.include_router(system.router)
@@ -190,16 +192,15 @@ def _build_speaker_profiler(engine):
     from config import load_settings
     from services.speaker_profiles import (
         SpeakerProfileService,
-        is_encoder_available,
+        encoder_import_error,
     )
 
     settings = load_settings()
     profiler = SpeakerProfileService(engine, settings)
-    if profiler.enabled and not is_encoder_available():
-        logger.warning(
-            "Voice profiling is enabled but the optional 'resemblyzer' package "
-            "is not installed; profiling jobs will fail until it is added."
-        )
+    if profiler.enabled:
+        problem = encoder_import_error()
+        if problem:
+            logger.warning("%s Profiling jobs will fail until it is fixed.", problem)
     return profiler
 
 

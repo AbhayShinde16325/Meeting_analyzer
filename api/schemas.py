@@ -130,6 +130,20 @@ class SystemStatus(BaseModel):
     can_record: bool
 
 
+class TranscriptMetricsOut(BaseModel):
+    """Post-transcription metrics for the primary transcription.
+
+    All values are measured from stored data: audio and transcription
+    durations, RTF, speaker counts and labelled/unknown speech percentages
+    (derived from segment durations), review-needed segment count, and the
+    job status/error.
+    """
+
+    transcript_id: uuid.UUID
+    computed_at: datetime
+    metrics: dict[str, Any]
+
+
 class SpeakerCandidate(BaseModel):
     profile_id: uuid.UUID
     display_name: str
@@ -149,6 +163,9 @@ class MeetingSpeakerOut(BaseModel):
     confidence: float | None = None
     status: str | None = None
     candidates: list[SpeakerCandidate] = Field(default_factory=list)
+    # Other labels in this meeting whose voice print is near-identical
+    # (diarization split one person into several labels).
+    same_voice_labels: list[str] = Field(default_factory=list)
 
 
 class SpeakerAssignRequest(BaseModel):

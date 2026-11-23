@@ -10,6 +10,9 @@ meeting's diarized speakers with the model's suggestions and lets the user:
 
 Confirmed assignments are what the transcript view uses to display profile
 names; the underlying profiles improve from confirmed meetings only.
+
+Layout: the picker and the decision buttons are separate rows so nothing
+overlaps at the minimum dialog width.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from typing import Any
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -36,6 +40,8 @@ from PySide6.QtWidgets import (
 
 from client.api_client import ApiClientError, ApiConnectionError, TeamMeetingAIClient
 from ui.qt_utils import worker_running
+
+_NEW_PROFILE = "__new__"
 
 
 class _SpeakersWorker(QThread):
@@ -112,23 +118,25 @@ class SpeakerReviewDialog(QDialog):
         self._can_process = can_process
         self.speakers: list[dict[str, Any]] = []
         self.profiles: list[dict[str, Any]] = []
+        self._busy = False
 
         self.setWindowTitle("Review speakers")
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(720)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 16)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
 
-        intro = QLabel(
+        self.intro_label = QLabel(
             "Speakers below were separated by diarization. Voice matching "
-            "only suggests a profile - a name appears in the transcript "
+            "only suggests a profile — a name appears in the transcript "
             "after you confirm it."
         )
-        intro.setWordWrap(True)
-        intro.setObjectName("muted")
-        layout.addWidget(intro)
+        self.intro_label.setWordWrap(True)
+        self.intro_label.setObjectName("muted")
+        layout.addWidget(self.intro_label)
 
+        # Row 1: the speakers table takes all available space.
         self.speakers_table = QTableWidget(0, 4)
         self.speakers_table.setHorizontalHeaderLabels(
             ["Speaker", "Speech", "Suggested match", "Status"]
@@ -151,54 +159,70 @@ class SpeakerReviewDialog(QDialog):
         self.speakers_table.itemSelectionChanged.connect(self._update_controls)
         layout.addWidget(self.speakers_table, 1)
 
-        self.hint_label = QLabel("")
-        self.hint_label.setWordWrap(True)
-        self.hint_label.setObjectName("muted")
-        layout.addWidget(self.hint_label)
-
-        editor = QHBoxLayout()
+        # Row 2: profile picker for the selected speaker (full width).
+        picker_row = QHBoxLayout()
+        picker_row.setSpacing(8)
         self.profile_combo_label = QLabel("Assign to profile:")
-        editor.addWidget(self.profile_combo_label)
-        self.profile_combo_label.setVisible(False)
-        self.profile_combo = _ProfileCombo()
-        editor.addWidget(self.profile_combo, 1)
-        self.profile_combo.setVisible(False)
+        picker_row.addWidget(self.profile_combo_label)
+        self.profile_combo = QComboBox()
+        self.profile_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.profile_combo.setMinimumContentsLength(24)
+        picker_row.addWidget(self.profile_combo, 1)
+        layout.addLayout(picker_row)
+
+        # Row 3: decision buttons, one verb each, left-aligned.
+        decision_row = QHBoxLayout()
+        decision_row.setSpacing(8)
         self.confirm_button = QPushButton("Confirm")
         self.confirm_button.setObjectName("primaryButton")
+        self.confirm_button.setToolTip(
+            "Attach this speaker's voice print to the selected profile and "
+            "show that name in the transcript."
+        )
         self.confirm_button.clicked.connect(self._confirm_assignment)
-        editor.addWidget(self.confirm_button)
-        self.reject_button = QPushButton("Not this person")
+        decision_row.addWidget(self.confirm_button)
+
+        self.reject_button = QPushButton("Reject")
         self.reject_button.setToolTip(
             "Mark this speaker as somebody we do not track; clears any match."
         )
         self.reject_button.clicked.connect(self._reject_assignment)
-        editor.addWidget(self.reject_button)
-        self.reset_button = QPushButton("Reset suggestion")
-        self.reset_button.setToolTip("Undo your decision; back to the model suggestion.")
-        self.reset_button.clicked.connect(self._reset_assignment)
-        editor.addWidget(self.reset_button)
-        layout.addLayout(editor)
+        decision_row.addWidget(self.reject_button)
 
-        controls = QHBoxLayout()
-        self.rename_button = QPushButton("Rename profile...")
-        self.rename_button.clicked.connect(self._rename_profile)
-        controls.addWidget(self.rename_button)
-        self.reprofile_button = QPushButton("Re-run voice profiling")
-        self.reprofile_button.setToolTip(
-            "Recompute voice prints for this meeting from its audio."
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.setToolTip(
+            "Undo your decision; back to the model's suggestion."
         )
-        self.reprofile_button.clicked.connect(self._reprofile)
-        controls.addWidget(self.reprofile_button)
-        controls.addStretch(1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        buttons.clicked.connect(self.close)
-        controls.addWidget(buttons)
-        layout.addLayout(controls)
+        self.reset_button.clicked.connect(self._reset_assignment)
+        decision_row.addWidget(self.reset_button)
+        decision_row.addStretch(1)
+        layout.addLayout(decision_row)
+
+        self.hint_label = QLabel("Select a speaker to review its match.")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setObjectName("muted")
+        layout.addWidget(self.hint_label)
 
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(line)
+
+        # Row 4: profile management and close.  Voice profiling itself runs
+        # automatically as part of transcription — no manual trigger here.
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(8)
+        self.rename_button = QPushButton("Rename profile...")
+        self.rename_button.setToolTip("Change the display name of a profile.")
+        self.rename_button.clicked.connect(self._rename_profile)
+        controls_row.addWidget(self.rename_button)
+        controls_row.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.clicked.connect(self.close)
+        controls_row.addWidget(buttons)
+        layout.addLayout(controls_row)
 
         self.notice_label = QLabel("")
         self.notice_label.setObjectName("errorText")
@@ -263,8 +287,11 @@ class SpeakerReviewDialog(QDialog):
 
     @staticmethod
     def _suggested_name(speaker: dict[str, Any]) -> str:
+        same_voice = speaker.get("same_voice_labels") or []
         candidates = speaker.get("candidates") or []
         if not candidates:
+            if same_voice:
+                return f"same voice as {same_voice[0]}"
             return "-"
         best = candidates[0]
         confidence = float(best.get("confidence") or 0.0)
@@ -272,7 +299,13 @@ class SpeakerReviewDialog(QDialog):
         return f"{name} ({confidence:.0%})"
 
     def _render_profiles(self) -> None:
-        self.profile_combo.reload(self.profiles)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("Choose a profile...", "")
+        for profile in self.profiles:
+            self.profile_combo.addItem(
+                str(profile.get("display_name", "")), str(profile.get("id"))
+            )
+        self.profile_combo.addItem("New profile...", _NEW_PROFILE)
 
     def _selected_speaker(self) -> dict[str, Any] | None:
         row = self.speakers_table.currentRow()
@@ -280,28 +313,49 @@ class SpeakerReviewDialog(QDialog):
             return None
         return self.speakers[row]
 
+    def _selected_profile_id(self) -> str | None:
+        data = self.profile_combo.currentData()
+        return str(data) if data else None
+
     # -- controls ------------------------------------------------------------
 
     def _update_controls(self) -> None:
         speaker = self._selected_speaker()
-        editable = self._can_process and speaker is not None
+        editable = self._can_process and speaker is not None and not self._busy
         has_selection = speaker is not None
-        self.profile_combo.setVisible(has_selection)
         self.profile_combo_label.setVisible(has_selection)
+        self.profile_combo.setVisible(has_selection)
         self.confirm_button.setEnabled(editable)
         self.reject_button.setEnabled(editable)
         self.reset_button.setEnabled(
-            editable
-            and str(speaker.get("status") or "") in ("confirmed", "rejected")  # type: ignore[union-attr]
+            editable and str(speaker.get("status") or "") in ("confirmed", "rejected")  # type: ignore[union-attr]
         )
-        self.rename_button.setEnabled(self._can_process and bool(self.profiles))
-        self.reprofile_button.setEnabled(self._can_process)
+        self.rename_button.setEnabled(
+            self._can_process and bool(self.profiles) and not self._busy
+        )
+        if self._busy:
+            return
         if speaker is None:
-            self.hint_label.setText("Select a speaker to review its match.")
+            self.hint_label.setText(
+                "Select a speaker above to review its match."
+                if self.speakers
+                else "No diarized speakers in this transcript yet. Run "
+                "transcription (and voice profiling) first."
+            )
+            return
+        same_voice = speaker.get("same_voice_labels") or []
+        if same_voice:
+            twins = ", ".join(str(label) for label in same_voice)
+            self.hint_label.setText(
+                f"This label sounds like the same voice as {twins}. "
+                "Diarization split one person into several labels — assign "
+                "both labels to the same profile (or a new one) to merge "
+                "them in the transcript."
+            )
         else:
             self.hint_label.setText(
-                "Confirm stores this meeting's voice print under the selected "
-                "profile and shows the name in the transcript."
+                "Confirm stores this speaker's voice print under the selected "
+                "profile and shows that name in the transcript."
             )
 
     def _show_notice(self, message: str) -> None:
@@ -309,16 +363,19 @@ class SpeakerReviewDialog(QDialog):
         self.notice_label.setVisible(bool(message))
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
+        self._busy = busy
+        self.speakers_table.setEnabled(not busy)
+        self.profile_combo.setEnabled(not busy)
         self.confirm_button.setEnabled(not busy)
         self.reject_button.setEnabled(not busy)
-        self.speakers_table.setEnabled(not busy)
+        self.reset_button.setEnabled(not busy)
+        self.rename_button.setEnabled(not busy)
         if message:
             self.hint_label.setText(message)
+        if not busy:
+            self._update_controls()
 
     # -- actions ---------------------------------------------------------------
-
-    def _selected_profile_id(self) -> str | None:
-        return self.profile_combo.selected_profile_id()
 
     def _confirm_assignment(self) -> None:
         speaker = self._selected_speaker()
@@ -326,7 +383,7 @@ class SpeakerReviewDialog(QDialog):
             return
         profile_id = self._selected_profile_id()
         fields: dict[str, Any] = {"status": "confirmed"}
-        if profile_id == "__new__":
+        if profile_id == _NEW_PROFILE:
             name, ok = QInputDialog.getText(
                 self, "New speaker profile", "Name for the new profile:"
             )
@@ -373,7 +430,7 @@ class SpeakerReviewDialog(QDialog):
             return
         profile_id = self._selected_profile_id()
         current = None
-        if profile_id and profile_id != "__new__":
+        if profile_id and profile_id != _NEW_PROFILE:
             for profile in self.profiles:
                 if str(profile.get("id")) == profile_id:
                     current = str(profile.get("display_name", ""))
@@ -389,7 +446,7 @@ class SpeakerReviewDialog(QDialog):
                 if str(profile.get("display_name", "")) == current:
                     profile_id = str(profile["id"])
                     break
-        if not profile_id or profile_id == "__new__":
+        if not profile_id or profile_id == _NEW_PROFILE:
             return
         new_name, ok = QInputDialog.getText(
             self, "Rename profile", "New name:", text=current
@@ -398,11 +455,6 @@ class SpeakerReviewDialog(QDialog):
         if not ok or not new_name or new_name == current:
             return
         self._run_action("rename", profile_id=profile_id, display_name=new_name)
-
-    def _reprofile(self) -> None:
-        if worker_running(self._action_worker):
-            return
-        self._run_action("profile_job", meeting_id=self.meeting_id)
 
     def _run_action(self, action: str, **kwargs: Any) -> None:
         if worker_running(self._action_worker):
@@ -421,44 +473,9 @@ class SpeakerReviewDialog(QDialog):
             self._set_busy(False)
             self._show_notice(str(error))
             return
-        if action == "profile_job":
-            self._set_busy(False)
-            self._show_notice(
-                "Voice profiling queued. The speaker list updates when the "
-                "job finishes."
-            )
-            return
         self._load()
 
     def shutdown(self) -> None:
         for worker in (self._load_worker, self._action_worker):
             if worker_running(worker):
                 worker.wait(5000)
-
-
-class _ProfileCombo(QWidget):
-    """Profile picker including an explicit 'create new profile' entry."""
-
-    NEW = "__new__"
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        from PySide6.QtWidgets import QComboBox
-
-        super().__init__(parent)
-        self._combo = QComboBox(self)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._combo)
-
-    def reload(self, profiles: list[dict[str, Any]]) -> None:
-        self._combo.clear()
-        self._combo.addItem("Choose a profile...", "")
-        for profile in profiles:
-            self._combo.addItem(
-                str(profile.get("display_name", "")), str(profile.get("id"))
-            )
-        self._combo.addItem("New profile...", self.NEW)
-
-    def selected_profile_id(self) -> str | None:
-        data = self._combo.currentData()
-        return str(data) if data else None

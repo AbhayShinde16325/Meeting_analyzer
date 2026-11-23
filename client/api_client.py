@@ -275,6 +275,13 @@ class TeamMeetingAIClient:
     def get_summary(self, meeting_id: str) -> dict[str, Any] | None:
         return self._request("GET", f"/meetings/{meeting_id}/summary")
 
+    def get_meeting_metrics(self, meeting_id: str) -> dict[str, Any] | None:
+        """Reference-free quality metrics for the primary transcript."""
+
+        return self._request(
+            "GET", f"/meetings/{meeting_id}/metrics"
+        )  # type: ignore[return-value]
+
     def list_action_items(self, meeting_id: str) -> list[dict[str, Any]]:
         return self._request(
             "GET", f"/meetings/{meeting_id}/action-items"

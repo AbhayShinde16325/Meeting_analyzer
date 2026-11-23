@@ -132,6 +132,11 @@ class SarvamTranscriptionProvider:
         hint = (self._settings.sarvam_language_hint or "").strip()
         if hint:
             params["language_code"] = hint
+        # Optional speaker-count hint for diarization: fixes
+        # over-segmentation where one person is reported as several labels.
+        num_speakers = int(self._settings.sarvam_num_speakers or 0)
+        if num_speakers > 0:
+            params["num_speakers"] = num_speakers
         try:
             return client.speech_to_text_job.create_job(**params)
         except TranscriptionCancelled:

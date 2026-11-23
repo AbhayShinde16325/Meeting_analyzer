@@ -384,6 +384,54 @@ def test_details_export_zip(window, server, client, user, tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# Metrics tab
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_tab_renders_measured_values(
+    window, server, client, user, pg_engine
+):
+    from sqlalchemy import text as sql_text
+
+    meeting = _seed_processed_meeting(server, client, user)
+    # Give the meeting a realistic duration so coverage is measurable.
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "UPDATE meetings SET duration_ms = 1000 WHERE id = :m"
+            ),
+            {"m": meeting["id"]},
+        )
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+
+    assert wait_until(
+        lambda: "Transcript metrics" in screen.metrics_browser.toPlainText()
+    )
+    text = screen.metrics_browser.toPlainText()
+    assert "Audio duration:" in text
+    assert "Real-time factor (RTF):" in text
+    assert "Speakers detected:" in text
+    assert "Speaker-labelled speech:" in text
+    assert "Segments needing review:" in text
+    assert "Transcription status:" in text
+    assert "Succeeded" in text
+
+
+def test_metrics_tab_empty_state_for_unprocessed_meeting(window, client, user):
+    meeting = _seed_meeting(client, user, title="No metrics meeting")
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+
+    assert wait_until(
+        lambda: "No quality metrics are available"
+        in screen.metrics_browser.toPlainText()
+    )
+
+
+# ---------------------------------------------------------------------------
 # Speaker review
 # ---------------------------------------------------------------------------
 
