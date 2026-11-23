@@ -8,6 +8,7 @@ runner on the server are faked; tests drive the pipeline synchronously.
 
 from __future__ import annotations
 
+import json
 import uuid
 import zipfile
 from pathlib import Path
@@ -380,6 +381,105 @@ def test_details_export_zip(window, server, client, user, tmp_path, monkeypatch)
     names = archive.namelist()
     assert "meeting.json" in names
     assert "transcripts/primary.txt" in names
+
+
+# ---------------------------------------------------------------------------
+# Speaker review
+# ---------------------------------------------------------------------------
+
+
+def test_details_confirmed_speaker_name_renders_in_transcript(
+    window, server, client, user, pg_engine
+):
+    """Only user-confirmed profile names replace the raw diarization label."""
+
+    from sqlalchemy import text as sql_text
+
+    meeting = _seed_processed_meeting(server, client, user)
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "Fake primary transcript content.",
+         "speaker": "spk-a"},
+    ]
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "UPDATE transcripts SET is_primary = false WHERE meeting_id = :m"
+            ),
+            {"m": meeting["id"]},
+        )
+        profile_id = conn.execute(
+            sql_text(
+                "INSERT INTO speaker_profiles (id, display_name) "
+                "VALUES (gen_random_uuid(), 'Alice') RETURNING id"
+            )
+        ).scalar_one()
+        transcript_id = conn.execute(
+            sql_text(
+                "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                "is_primary, text, segments) VALUES (gen_random_uuid(), :m, "
+                "'fake', 'fake-model', true, 'diarized', "
+                "CAST(:segments AS jsonb)) RETURNING id"
+            ),
+            {"m": meeting["id"], "segments": json.dumps(segments)},
+        ).scalar_one()
+        conn.execute(
+            sql_text(
+                "INSERT INTO speaker_assignments (id, meeting_id, transcript_id, "
+                "local_label, profile_id, status) VALUES (gen_random_uuid(), :m, "
+                ":t, 'spk-a', :p, 'confirmed')"
+            ),
+            {"m": meeting["id"], "t": transcript_id, "p": profile_id},
+        )
+
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+
+    # The confirmed profile name replaces the label; a suggested-only match
+    # must never do so.
+    assert wait_until(lambda: "Alice:" in screen.transcript_browser.toPlainText())
+    assert "spk-a" not in screen.transcript_browser.toPlainText()
+    assert screen.review_speakers_button.isEnabled()
+
+
+def test_speaker_review_dialog_lists_meeting_speakers(
+    window, server, client, user, pg_engine
+):
+    from sqlalchemy import text as sql_text
+
+    from ui.speaker_review import SpeakerReviewDialog
+
+    meeting = _seed_processed_meeting(server, client, user)
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "Fake primary transcript content.",
+         "speaker": "spk-a"},
+    ]
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "UPDATE transcripts SET segments = CAST(:segments AS jsonb) "
+                "WHERE meeting_id = :m AND is_primary = true"
+            ),
+            {"m": meeting["id"], "segments": json.dumps(segments)},
+        )
+
+    _login(window, user)
+    window._open_meeting(meeting["id"])
+    screen = window.details_screen
+    assert wait_until(lambda: screen.review_speakers_button.isEnabled())
+
+    dialog = SpeakerReviewDialog(screen.client, meeting["id"], can_process=True)
+    try:
+        assert wait_until(lambda: dialog.speakers_table.rowCount() == 1)
+        assert dialog.speakers_table.item(0, 0).text() == "spk-a"
+        # No embedding, no profiles: no candidates and nothing confirmed.
+        assert dialog.speakers_table.item(0, 3).text() == "No voice print"
+        assert not dialog.confirm_button.isEnabled() or (
+            dialog.speakers_table.currentRow() < 0
+        )
+    finally:
+        dialog.shutdown()
+        dialog.deleteLater()
 
 
 # ---------------------------------------------------------------------------

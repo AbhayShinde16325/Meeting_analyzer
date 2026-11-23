@@ -130,6 +130,23 @@ safe: it never deletes data. Generated secrets are printed once — save them.
 6. Deleting a meeting removes its audio, transcripts, summaries, and action
    items in one transaction.
 
+### Speaker profiles (voice profiling, optional)
+
+When voice profiling is enabled on the server (see configuration below), a
+`profiling` job computes a local voice print per diarized speaker after
+transcription and may attach **suggestions** to known speaker profiles.
+
+- Voice similarity never names anyone: the transcript shows a profile name
+  only after a user confirms the match in **Review speakers** (meeting
+  details screen). Unmatched speakers stay as their meeting-local label
+  (e.g. `Speaker 0`) until a user creates a profile for them.
+- Review lets the host confirm a suggestion, pick a different profile,
+  create a new profile, reject a speaker ("not tracked"), reset to the
+  suggestion, and rename profiles. Confirmations feed future matching;
+  rejections survive re-profiling.
+- Embeddings and matches are computed locally (Resemblyzer, CPU); no voice
+  data is sent anywhere.
+
 ## Backups
 
 ```powershell
@@ -160,6 +177,11 @@ variables; real variables win). Server-only variables:
 | `TEAMMEETINGAI_GROQ_MODEL` | blank | Groq model (required with `groq`) |
 | `TEAMMEETINGAI_GROQ_TIMEOUT` | `60` | Groq request timeout (seconds) |
 | `TEAMMEETINGAI_GROQ_API_KEY` | blank | Groq key (required with `groq`) |
+| `TEAMMEETINGAI_VOICE_PROFILING` | unset | `1` enables voice profiling (requires `resemblyzer`; DB migration 0002) |
+| `TEAMMEETINGAI_VOICE_MATCH_THRESHOLD` | `0.80` | Cosine similarity for an automatic *suggested* match |
+| `TEAMMEETINGAI_VOICE_REVIEW_THRESHOLD` | `0.70` | Cosine similarity for a manual candidate in the review UI |
+| `TEAMMEETINGAI_VOICE_MIN_SEGMENT_SECONDS` | `3` | Minimum speech per speaker to compute a voice print |
+| `TEAMMEETINGAI_VOICE_MAX_SEGMENTS_PER_SPEAKER` | `20` | Segments used per speaker when embedding |
 
 Client and transcription-fallback variables:
 

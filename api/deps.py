@@ -33,6 +33,20 @@ def get_engine(request: Request) -> Engine:
     return request.app.state.engine
 
 
+def get_speaker_profiler(request: Request):
+    """The voice-profile service wired at startup (always present, may be disabled)."""
+
+    profiler = getattr(request.app.state, "speaker_profiler", None)
+    if profiler is None:
+        raise errors.ApiError(
+            503, "profiling_unavailable", "Voice profiling is not configured."
+        )
+    return profiler
+
+
+ProfilerDep = Annotated[Any, Depends(get_speaker_profiler)]
+
+
 def get_conn(
     engine: Annotated[Engine, Depends(get_engine)],
 ) -> Iterator[Connection]:

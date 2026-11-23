@@ -54,8 +54,11 @@ ATTACHMENT_MIME_TYPES = (
 AUDIO_KINDS = ("original_audio_48k", "derived_audio_16k")
 FILE_KINDS = AUDIO_KINDS + ("attachment",)
 MEETING_STATUSES = ("recording", "recorded", "transcribed", "analyzing", "completed", "failed")
-JOB_TYPES = ("transcription", "analysis")
+JOB_TYPES = ("transcription", "analysis", "profiling")
 JOB_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
+# Voice-profile matching states.  'suggested' rows are model output only and
+# must be confirmed by a user before any profile name is displayed.
+SPEAKER_ASSIGNMENT_STATUSES = ("suggested", "confirmed", "rejected")
 
 # SQL fragment shared by the attachment CHECK constraints: the rules only apply
 # when the row actually is an attachment.
@@ -311,6 +314,122 @@ class ProcessingJob(Base):
     created_at: Mapped[datetime] = _created_at()
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, onupdate=func.now()
+    )
+
+
+class SpeakerProfile(Base):
+    """A persistent person identified by voice; named only by users.
+
+    Voice similarity alone never claims an identity: profiles start empty
+    (or as a rename of an unknown meeting speaker) and grow only from
+    embeddings the user explicitly confirmed.
+    """
+
+    __tablename__ = "speaker_profiles"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    display_name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, onupdate=func.now()
+    )
+
+
+class SpeakerEmbedding(Base):
+    """One voice embedding computed from a meeting speaker's segments.
+
+    ``embedding`` is a fixed-length float vector stored as JSONB (audio
+    itself stays in Large Objects; this is a derived, small numeric array).
+    ``profile_id`` links the embedding to a profile only after the user
+    confirmed the assignment, so confirmed data alone drives future matching.
+    """
+
+    __tablename__ = "speaker_embeddings"
+    __table_args__ = (
+        Index(
+            "uq_speaker_embeddings_label",
+            "transcript_id",
+            "local_label",
+            unique=True,
+        ),
+        Index("ix_speaker_embeddings_profile_id", "profile_id"),
+        Index("ix_speaker_embeddings_meeting_id", "meeting_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    transcript_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("transcripts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("speaker_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # The diarization label inside the transcript, e.g. "Speaker 0".
+    local_label: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list] = mapped_column(JSONB, nullable=False)
+    # Total seconds of speech used to build this embedding (quality signal).
+    source_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class SpeakerAssignment(Base):
+    """User-reviewable mapping from a meeting-local speaker to a profile.
+
+    One row per (transcript, local label).  Rows created by automatic
+    matching are ``suggested`` with a similarity ``confidence``; only the
+    user can make them ``confirmed`` (or ``rejected``).
+    """
+
+    __tablename__ = "speaker_assignments"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ("
+            + ", ".join(f"'{s}'" for s in SPEAKER_ASSIGNMENT_STATUSES)
+            + ")",
+            name="status_allowed",
+        ),
+        Index(
+            "uq_speaker_assignments_label",
+            "transcript_id",
+            "local_label",
+            unique=True,
+        ),
+        Index("ix_speaker_assignments_meeting_id", "meeting_id"),
+        Index("ix_speaker_assignments_profile_id", "profile_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    transcript_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("transcripts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("speaker_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    local_label: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="suggested", server_default="suggested"
+    )
+    created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, onupdate=func.now()
     )

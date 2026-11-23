@@ -17,3 +17,5 @@ __pycache__/
 
 # Database dumps produced by scripts/backup_database.py
 backups/
+golden_audio_synthetic/
+scratch_*.log

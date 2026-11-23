@@ -37,6 +37,7 @@ from client.api_client import (
 )
 from config import Settings
 from ui.qt_utils import worker_running
+from ui.speaker_review import SpeakerReviewDialog
 
 try:  # PySide6 multimedia is included in the standard wheel.
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -128,6 +129,7 @@ class _DetailsWorker(QThread):
                 "summary": self.client.get_summary(self.meeting_id),
                 "action_items": self.client.list_action_items(self.meeting_id),
                 "jobs": self.client.list_jobs(self.meeting_id),
+                "speakers": self.client.list_meeting_speakers(self.meeting_id),
             }
         except (ApiClientError, ApiConnectionError) as exc:
             self.completed.emit(None, str(exc))
@@ -321,9 +323,18 @@ class MeetingDetailsScreen(QWidget):
         self.export_button.clicked.connect(self._export_meeting)
         self.export_button.setEnabled(False)
 
+        self.review_speakers_button = QPushButton("Review speakers")
+        self.review_speakers_button.setToolTip(
+            "Review diarized speakers and confirm voice-profile matches. "
+            "Confirmed names appear in the transcript."
+        )
+        self.review_speakers_button.clicked.connect(self._review_speakers)
+        self.review_speakers_button.setEnabled(False)
+
         actions.addWidget(self.play_button)
         actions.addWidget(self.transcribe_button)
         actions.addWidget(self.analyse_button)
+        actions.addWidget(self.review_speakers_button)
         actions.addWidget(self.cancel_button)
         actions.addStretch(1)
         actions.addWidget(self.export_button)
@@ -611,6 +622,19 @@ class MeetingDetailsScreen(QWidget):
             "</style></head><body>" + body + "</body></html>"
         )
 
+    def _confirmed_speaker_names(self) -> dict[str, str]:
+        """Local diarization label -> confirmed profile name (user-reviewed)."""
+
+        mapping: dict[str, str] = {}
+        for speaker in (self._details or {}).get("speakers") or []:
+            if (
+                speaker.get("status") == "confirmed"
+                and speaker.get("profile_name")
+                and speaker.get("local_label")
+            ):
+                mapping[str(speaker["local_label"])] = str(speaker["profile_name"])
+        return mapping
+
     def _render_transcript(self, details: dict[str, Any]) -> None:
         transcript = self._primary_transcript(details)
         if not transcript:
@@ -622,6 +646,7 @@ class MeetingDetailsScreen(QWidget):
             )
             return
 
+        confirmed = self._confirmed_speaker_names()
         segments = transcript.get("segments") or []
         parts = ["<h2>Transcript</h2>"]
         language = transcript.get("language")
@@ -646,7 +671,10 @@ class MeetingDetailsScreen(QWidget):
                 text = html.escape(str(segment.get("text", "")))
                 speaker = segment.get("speaker")
                 if isinstance(speaker, str) and speaker.strip():
-                    label = html.escape(speaker.strip())
+                    # Only user-confirmed profiles replace the raw label;
+                    # suggestions never claim an identity.
+                    label = confirmed.get(speaker.strip(), speaker.strip())
+                    label = html.escape(label)
                     parts.append(f"<p><b>[{start}] {label}:</b> {text}</p>")
                 else:
                     parts.append(f"<p><b>[{start}]</b> {text}</p>")
@@ -708,6 +736,7 @@ class MeetingDetailsScreen(QWidget):
             self.play_button.setEnabled(False)
             self.transcribe_button.setEnabled(False)
             self.analyse_button.setEnabled(False)
+            self.review_speakers_button.setEnabled(False)
             self.export_button.setEnabled(False)
             self.open_attachment_button.setEnabled(False)
             return
@@ -718,6 +747,7 @@ class MeetingDetailsScreen(QWidget):
         transcript = self._primary_transcript(details) or {}
         has_transcript = bool(str(transcript.get("text") or "").strip())
         has_summary = details.get("summary") is not None
+        has_speakers = bool(details.get("speakers"))
 
         self.play_button.setEnabled(
             audio is not None and idle and self._player is not None
@@ -744,6 +774,9 @@ class MeetingDetailsScreen(QWidget):
         )
         self.analyse_button.setToolTip(
             "" if self._can_process else "Only the meeting host can queue jobs."
+        )
+        self.review_speakers_button.setEnabled(
+            has_transcript and idle and (self._can_process or has_speakers)
         )
         self.export_button.setEnabled(idle)
 
@@ -875,6 +908,20 @@ class MeetingDetailsScreen(QWidget):
         if self._meeting_id is None or self._processing:
             return
         self._run_action("analyse", meeting_id=self._meeting_id)
+
+    def _review_speakers(self) -> None:
+        if self._meeting_id is None or self._processing:
+            return
+        dialog = SpeakerReviewDialog(
+            self.client,
+            self._meeting_id,
+            can_process=self._can_process,
+            parent=self,
+        )
+        dialog.exec()
+        dialog.shutdown()
+        dialog.deleteLater()
+        self.reload()
 
     def _request_cancel(self) -> None:
         if not self._processing or self._details is None:

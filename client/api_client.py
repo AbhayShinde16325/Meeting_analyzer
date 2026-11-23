@@ -285,6 +285,51 @@ class TeamMeetingAIClient:
             "PATCH", f"/action-items/{item_id}", json=fields, host_only=True
         )  # type: ignore[return-value]
 
+    # -- speaker profiles -----------------------------------------------------
+
+    def list_meeting_speakers(self, meeting_id: str) -> list[dict[str, Any]]:
+        return self._request(
+            "GET", f"/meetings/{meeting_id}/speakers"
+        )  # type: ignore[return-value]
+
+    def assign_meeting_speaker(
+        self, meeting_id: str, local_label: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Host-only: confirm/reject/reset a speaker label's profile match."""
+
+        return self._request(
+            "POST",
+            f"/meetings/{meeting_id}/speakers/{local_label}/assign",
+            json=fields,
+            host_only=True,
+        )  # type: ignore[return-value]
+
+    def request_profiling(self, meeting_id: str) -> dict[str, Any]:
+        """Host-only: (re-)queue the voice-profiling job; 409 when active."""
+
+        return self._request(
+            "POST", f"/meetings/{meeting_id}/speakers/profile", host_only=True
+        )  # type: ignore[return-value]
+
+    def list_speaker_profiles(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/profiles")  # type: ignore[return-value]
+
+    def create_speaker_profile(self, display_name: str) -> dict[str, Any]:
+        return self._request(
+            "POST", "/profiles", json={"display_name": display_name}, host_only=True
+        )  # type: ignore[return-value]
+
+    def rename_speaker_profile(self, profile_id: str, display_name: str) -> dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/profiles/{profile_id}",
+            json={"display_name": display_name},
+            host_only=True,
+        )  # type: ignore[return-value]
+
+    def delete_speaker_profile(self, profile_id: str) -> None:
+        self._request("DELETE", f"/profiles/{profile_id}", host_only=True)
+
     # -- jobs ---------------------------------------------------------------
 
     def list_jobs(self, meeting_id: str) -> list[dict[str, Any]]:

@@ -38,6 +38,7 @@ from ai.transcription import (
     TranscriptionService,
 )
 from db import lo
+from services.speaker_profiles import SpeakerProfileService, SpeakerProfilingError
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +57,12 @@ class TranscriptionPipeline:
         engine: Engine,
         transcription_service: TranscriptionService,
         summarizer: MeetingSummarizer | None,
+        speaker_profiler: SpeakerProfileService | None = None,
     ) -> None:
         self._engine = engine
         self._transcription_service = transcription_service
         self._summarizer = summarizer
+        self._speaker_profiler = speaker_profiler
         # Per-instance progress throttle state: job id -> last monotonic update.
         self._progress_log: dict[str, float] = {}
 
@@ -86,11 +89,18 @@ class TranscriptionPipeline:
                 self._run_transcription(job_id, str(job["meeting_id"]))
             elif job["job_type"] == "analysis":
                 self._run_analysis(job_id, str(job["meeting_id"]))
+            elif job["job_type"] == "profiling":
+                self._run_profiling(job_id, str(job["meeting_id"]))
             else:
                 raise PipelineError(f"Unknown job type {job['job_type']!r}.")
         except TranscriptionCancelled:
             self._fail_job(job_id, "cancelled", "Cancelled at the user's request.")
-        except (TranscriptionError, NoSpeechError, SummarizationError) as exc:
+        except (
+            TranscriptionError,
+            NoSpeechError,
+            SummarizationError,
+            SpeakerProfilingError,
+        ) as exc:
             self._fail_job(job_id, "failed", str(exc))
         except Exception as exc:  # unexpected - keep the server alive
             logger.exception("Job %s failed unexpectedly.", job_id)
@@ -221,6 +231,16 @@ class TranscriptionPipeline:
             except Exception:  # analysis failure must not lose the transcript
                 logger.exception("Chained analysis failed after transcription.")
 
+        # Chain voice profiling automatically when enabled and a real encoder
+        # is available.  Failures are logged and visible on the job row but
+        # never lose the transcript.
+        if self._speaker_profiler is not None and self._speaker_profiler.enabled:
+            profiling_job_id = self._enqueue_profiling(meeting_id)
+            try:
+                self.run_job(profiling_job_id)
+            except Exception:
+                logger.exception("Chained profiling failed after transcription.")
+
     def _enqueue_analysis(self, meeting_id: str) -> str:
         with self._engine.begin() as conn:
             return conn.execute(
@@ -228,6 +248,17 @@ class TranscriptionPipeline:
                     "INSERT INTO processing_jobs (id, meeting_id, job_type, status, "
                     "message) VALUES (gen_random_uuid(), :m, 'analysis', 'queued', "
                     "'Queued for analysis') RETURNING id"
+                ),
+                {"m": meeting_id},
+            ).scalar_one()
+
+    def _enqueue_profiling(self, meeting_id: str) -> str:
+        with self._engine.begin() as conn:
+            return conn.execute(
+                text(
+                    "INSERT INTO processing_jobs (id, meeting_id, job_type, status, "
+                    "message) VALUES (gen_random_uuid(), :m, 'profiling', 'queued', "
+                    "'Queued for voice profiling') RETURNING id"
                 ),
                 {"m": meeting_id},
             ).scalar_one()
@@ -324,6 +355,102 @@ class TranscriptionPipeline:
                 {"id": job_id},
             )
         logger.info("Analysis job %s succeeded for meeting %s.", job_id, meeting_id)
+
+    # -- voice profiling ------------------------------------------------------
+
+    def _run_profiling(self, job_id: str, meeting_id: str) -> None:
+        """Compute per-speaker voice embeddings for the primary transcript."""
+
+        if self._speaker_profiler is None:
+            raise SpeakerProfilingError("Voice profiling is not wired up.")
+
+        self._mark_job(job_id, "running", message="Profiling speakers...")
+
+        with self._engine.begin() as conn:
+            primary = conn.execute(
+                text(
+                    "SELECT id, segments FROM transcripts WHERE meeting_id = :m "
+                    "AND is_primary = true"
+                ),
+                {"m": meeting_id},
+            ).mappings().one_or_none()
+            if primary is None:
+                raise SpeakerProfilingError(
+                    "This meeting has no primary transcript yet. Transcribe it first."
+                )
+            segments = list(primary["segments"] or [])
+            labeled = [
+                segment
+                for segment in segments
+                if isinstance(segment, dict)
+                and isinstance(segment.get("speaker"), str)
+                and segment.get("speaker", "").strip()
+            ]
+            file_row = conn.execute(
+                text(
+                    "SELECT lo_oid FROM meeting_files WHERE meeting_id = :m "
+                    "AND kind = 'derived_audio_16k'"
+                ),
+                {"m": meeting_id},
+            ).mappings().one_or_none()
+
+        if not labeled:
+            self._finish_profiling(
+                job_id,
+                "No diarized speakers in this transcript; nothing to profile.",
+            )
+            logger.info(
+                "Profiling job %s finished without speakers (meeting %s).",
+                job_id,
+                meeting_id,
+            )
+            return
+        if file_row is None:
+            raise SpeakerProfilingError(
+                "The 16 kHz audio track is missing; voice profiles cannot be computed."
+            )
+
+        def progress(percent: float, message: str) -> None:
+            self._update_progress(job_id, 0.1 + 0.8 * percent, message)
+
+        with tempfile.TemporaryDirectory(prefix="tma-profile-") as temp_dir:
+            audio_path = Path(temp_dir) / "audio-16k-mono.wav"
+            with self._engine.connect() as conn:
+                with open(audio_path, "wb") as target:
+                    lo.copy_lo_to_stream(conn, int(file_row["lo_oid"]), target)
+            stored = self._speaker_profiler.compute_and_store(
+                meeting_id=meeting_id,
+                transcript_id=str(primary["id"]),
+                audio_path=audio_path,
+                segments=segments,
+                progress_cb=progress,
+            )
+
+        if not stored:
+            self._finish_profiling(
+                job_id,
+                "Speakers present but too little speech per speaker to profile.",
+            )
+            return
+        self._finish_profiling(
+            job_id, f"Voice profiles computed for {len(stored)} speaker(s)."
+        )
+        logger.info(
+            "Profiling job %s succeeded for meeting %s (%d speakers).",
+            job_id,
+            meeting_id,
+            len(stored),
+        )
+
+    def _finish_profiling(self, job_id: str, message: str) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE processing_jobs SET status = 'succeeded', progress = 1.0, "
+                    "message = :message, finished_at = now() WHERE id = :id"
+                ),
+                {"id": job_id, "message": message},
+            )
 
     # -- job bookkeeping ----------------------------------------------------
 

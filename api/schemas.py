@@ -130,6 +130,52 @@ class SystemStatus(BaseModel):
     can_record: bool
 
 
+class SpeakerCandidate(BaseModel):
+    profile_id: uuid.UUID
+    display_name: str
+    confidence: float
+
+
+class MeetingSpeakerOut(BaseModel):
+    """One meeting-local diarized label with its review state."""
+
+    local_label: str
+    segment_count: int
+    speech_seconds: float
+    has_embedding: bool
+    embedded_profile_id: uuid.UUID | None = None
+    profile_id: uuid.UUID | None = None
+    profile_name: str | None = None
+    confidence: float | None = None
+    status: str | None = None
+    candidates: list[SpeakerCandidate] = Field(default_factory=list)
+
+
+class SpeakerAssignRequest(BaseModel):
+    """A user decision for one meeting-local speaker label."""
+
+    profile_id: uuid.UUID | None = None
+    # Create a brand-new profile with this name and confirm the label into it.
+    new_profile_name: str | None = Field(default=None, min_length=1, max_length=120)
+    status: str = Field(pattern="^(suggested|confirmed|rejected)$")
+
+
+class SpeakerProfileOut(BaseModel):
+    id: uuid.UUID
+    display_name: str
+    created_at: datetime
+    updated_at: datetime | None = None
+    embedding_count: int = 0
+
+
+class SpeakerProfileCreate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+
+
+class SpeakerProfileRename(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+
+
 class AttachmentUploadResult(BaseModel):
     file: MeetingFileOut
     message: str = "Attachment stored."

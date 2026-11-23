@@ -4,6 +4,10 @@ Reads the database URL from the environment (``TEAMMEETINGAI_DATABASE_URL`` or
 ``DATABASE_URL``) so secrets stay out of ``alembic.ini``.  Supports
 ``-x url=<sqlalchemy_url>`` for scripts and tests that target a scratch
 database.
+
+The project-root ``.env`` file is loaded (without overriding variables that
+are already set in the shell) so a plain ``alembic upgrade head`` connects
+the same way as the uvicorn server started via ``scripts/run_server.bat``.
 """
 
 from __future__ import annotations
@@ -18,6 +22,16 @@ from db.base import Base
 from db.session import database_url_from_env
 
 config = context.config
+
+# ``alembic`` is normally run from the repository root; the search walks up
+# from the CWD, so it also works from subdirectories.  Real environment
+# variables always win over .env values.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover - python-dotenv is a pinned dependency
+    pass
 
 # Allow callers (tests, scripts) to opt out of reconfiguring logging, which
 # would otherwise clobber the application's logging setup.

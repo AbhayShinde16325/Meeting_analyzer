@@ -178,6 +178,24 @@ class Settings:
     # "en-IN").  Empty means auto-detect, which is the default behaviour.
     sarvam_language_hint: str = ""
 
+    # Voice profiling V1.  Requires the optional 'resemblyzer' package;
+    # without the flag (or the package) the pipeline behaves exactly as
+    # before and no voice embeddings are computed.  Matching never assigns
+    # an identity by itself: automatic matches are 'suggested' only and the
+    # user confirms them in the UI.
+    voice_profiling_enabled: bool = False
+    # Cosine similarity at or above which a match becomes an automatic
+    # 'suggested' assignment (still user-confirmable).
+    voice_match_threshold: float = 0.80
+    # Cosine similarity at or above which a profile is offered as a manual
+    # candidate in the review UI (below the auto-suggest threshold).
+    voice_review_threshold: float = 0.70
+    # Minimum total seconds of speech per speaker label to compute an
+    # embedding; shorter labels stay unmatched/unknown.
+    voice_min_segment_seconds: float = 3.0
+    # Upper bound on transcript segments used per speaker label.
+    voice_max_segments_per_speaker: int = 20
+
     # Local LLM (Ollama).  Reserved for a future local analysis backend.
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
@@ -273,6 +291,19 @@ def load_settings() -> Settings:
         sarvam_language_hint=os.environ.get(
             "TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", ""
         ).strip(),
+        voice_profiling_enabled=_bool_env("TEAMMEETINGAI_VOICE_PROFILING"),
+        voice_match_threshold=_float_env(
+            "TEAMMEETINGAI_VOICE_MATCH_THRESHOLD", 0.80
+        ),
+        voice_review_threshold=_float_env(
+            "TEAMMEETINGAI_VOICE_REVIEW_THRESHOLD", 0.70
+        ),
+        voice_min_segment_seconds=_float_env(
+            "TEAMMEETINGAI_VOICE_MIN_SEGMENT_SECONDS", 3.0
+        ),
+        voice_max_segments_per_speaker=_int_env(
+            "TEAMMEETINGAI_VOICE_MAX_SEGMENTS_PER_SPEAKER", 20
+        ),
         ollama_host=os.environ.get(
             "TEAMMEETINGAI_OLLAMA_HOST", "http://localhost:11434"
         ),

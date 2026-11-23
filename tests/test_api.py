@@ -553,10 +553,10 @@ class TestSearchAndSystem:
         status = api.get("/system/status").json()
         assert status["meeting_count"] == 1
         assert status["db_size_bytes"] > 0
-        assert status["schema_version"] == "0001_initial"
+        assert status["schema_version"] == "0002_speaker_profiles"
         assert status["can_record"] is True
 
     def test_health(self, api):
         response = api.get("/health").json()
         assert response["status"] == "ok"
-        assert response["schema"] == "0001_initial"
+        assert response["schema"] == "0002_speaker_profiles"
