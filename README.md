@@ -153,6 +153,7 @@ variables; real variables win). Server-only variables:
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql+psycopg://localhost/teammeetingai` | Server database (also `TEAMMEETINGAI_DATABASE_URL`) |
 | `TEAMMEETINGAI_SARVAM_API_KEY` | blank | Sarvam transcription key |
+| `TEAMMEETINGAI_SARVAM_LANGUAGE_HINT` | blank | Optional BCP-47 language hint (e.g. `hi-IN`) sent to Sarvam; blank auto-detects |
 | `TEAMMEETINGAI_HOST_TOKEN` | blank | Shared host secret for mutating endpoints |
 | `TEAMMEETINGAI_ANALYSIS_BACKEND` | `none` | `groq` enables analysis |
 | `TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS` | unset | Must be `1` to enable cloud analysis |

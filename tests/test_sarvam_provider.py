@@ -14,7 +14,7 @@ from ai.sarvam_provider import (
     SarvamTranscriptionProvider,
 )
 from ai.transcription import TranscriptionCancelled, TranscriptionError
-from config import Settings
+from config import Settings, load_settings
 
 _SAMPLE_PAYLOAD = {
     "request_id": "req-1",
@@ -102,6 +102,37 @@ class TestConfiguration:
         assert request["model"] == MODEL_NAME
         assert request["mode"] == "translit"
         assert request["with_diarization"] is True
+
+    def test_language_hint_is_sent_when_configured(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", "hi-IN")
+        monkeypatch.setenv("TEAMMEETINGAI_DATA_DIR", str(tmp_path))
+        settings = load_settings()
+        client = FakeClient(FakeJob())
+        provider = SarvamTranscriptionProvider(settings, client=client, poll_interval=0.01)
+        audio = tmp_path / "audio.wav"
+        audio.write_bytes(b"RIFF....")
+        provider.transcribe(audio)
+        assert client.calls[0]["language_code"] == "hi-IN"
+
+    def test_no_language_code_is_sent_without_hint(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", raising=False)
+        settings = make_settings(tmp_path, monkeypatch)
+        client = FakeClient(FakeJob())
+        provider = SarvamTranscriptionProvider(settings, client=client, poll_interval=0.01)
+        audio = tmp_path / "audio.wav"
+        audio.write_bytes(b"RIFF....")
+        provider.transcribe(audio)
+        assert "language_code" not in client.calls[0]
+
+    def test_blank_language_hint_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", "   ")
+        settings = make_settings(tmp_path, monkeypatch)
+        client = FakeClient(FakeJob())
+        provider = SarvamTranscriptionProvider(settings, client=client, poll_interval=0.01)
+        audio = tmp_path / "audio.wav"
+        audio.write_bytes(b"RIFF....")
+        provider.transcribe(audio)
+        assert "language_code" not in client.calls[0]
 
 
 class TestSuccessPath:

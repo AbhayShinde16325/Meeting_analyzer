@@ -64,11 +64,16 @@ class SarvamTranscriptionProvider:
         client: Any = None,
         poll_interval: float | None = None,
         timeout: float | None = None,
+        transcript_mode: str | None = None,
     ) -> None:
         self._settings = settings
         self._client = client  # injectable for tests
         self._poll_interval = poll_interval if poll_interval is not None else 5.0
         self._timeout = timeout if timeout is not None else 1800.0
+        # Roman transliteration is the production default; callers (e.g. the
+        # evaluation harness) may request the native script instead.
+        if transcript_mode is not None:
+            self.transcript_mode = transcript_mode
 
     # -- public API ---------------------------------------------------------
 
@@ -82,7 +87,8 @@ class SarvamTranscriptionProvider:
     ) -> TranscriptionResult:
         """Transcribe ``audio_path`` via the Sarvam batch API.
 
-        Language is auto-detected by Sarvam when not supplied.  Raises
+        Language is auto-detected by Sarvam unless
+        ``TEAMMEETINGAI_SARVAM_LANGUAGE_HINT`` is configured.  Raises
         :class:`TranscriptionCancelled` when ``cancel_cb`` returns True; the
         remote job is abandoned (Sarvam jobs expire on their own).
         """
@@ -116,12 +122,18 @@ class SarvamTranscriptionProvider:
 
     def _create_job(self, client: Any, cancel_cb: CancelCallback | None) -> Any:
         self._check_cancelled(cancel_cb)
+        params: dict[str, Any] = {
+            "model": MODEL_NAME,
+            "mode": self.transcript_mode,
+            "with_diarization": True,
+        }
+        # Optional language hint (BCP-47, e.g. "hi-IN") for audio that the
+        # auto-detector reliably misdetects (Hinglish code-switching).
+        hint = (self._settings.sarvam_language_hint or "").strip()
+        if hint:
+            params["language_code"] = hint
         try:
-            return client.speech_to_text_job.create_job(
-                model=MODEL_NAME,
-                mode="translit",
-                with_diarization=True,
-            )
+            return client.speech_to_text_job.create_job(**params)
         except TranscriptionCancelled:
             raise
         except Exception as exc:

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
+from ai.segment_postprocess import postprocess_segments
 from config import Settings
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,18 @@ class TranscriptionService:
             )
 
         segments = _normalise_segments(result.segments)
+        segments, removed = postprocess_segments(segments)
+        if removed:
+            # Deduplication only ever fires on echo duplications, so the
+            # full text must be rebuilt from the kept segments or the
+            # duplicated utterance would still reach the analysis stage.
+            logger.info("Removed %d duplicated segment(s).", removed)
+            text = "\n".join(str(segment["text"]) for segment in segments)
+            if not text.strip():
+                raise NoSpeechError(
+                    "No speech was recognized in the recording. Check that the "
+                    "microphone and system audio were audible."
+                )
         logger.info("Transcription complete: %s segments.", len(segments))
         if progress_cb is not None:
             progress_cb(1.0, "Transcription complete.")

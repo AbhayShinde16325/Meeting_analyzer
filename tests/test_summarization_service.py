@@ -90,3 +90,65 @@ def test_unknown_owner_and_deadline_normalized(settings):
     analysis = MeetingSummarizer(settings, provider=provider).analyze("Transcript")
     assert analysis["action_items"][0]["owner"] is None
     assert analysis["action_items"][0]["deadline"] is None
+
+
+def test_prompt_rejects_query_style_action_items(settings):
+    provider = FakeAnalysisProvider([valid_analysis()])
+    MeetingSummarizer(settings, provider=provider).analyze("Transcript")
+    system_prompt = provider.calls[0]["system_prompt"]
+    assert "not an action" in system_prompt
+    assert "open_questions" in system_prompt
+
+
+def test_implausible_deadline_is_retried_then_recovered(settings):
+    provider = FakeAnalysisProvider(
+        [
+            valid_analysis(deadline="2-2 March"),
+            valid_analysis(deadline="Friday"),
+        ]
+    )
+    analysis = MeetingSummarizer(settings, provider=provider).analyze(
+        "We agreed to ship on Friday."
+    )
+    assert analysis["action_items"][0]["deadline"] == "Friday"
+    assert len(provider.calls) == 2
+    # The retry carries a corrective note derived from the failure.
+    assert "failed validation" in provider.calls[1]["user_prompt"]
+
+
+def test_implausible_deadline_is_nulled_when_retry_also_fails(settings):
+    provider = FakeAnalysisProvider([valid_analysis(deadline="2-2 March")])
+    analysis = MeetingSummarizer(settings, provider=provider).analyze(
+        "We agreed to ship the release."
+    )
+    item = analysis["action_items"][0]
+    assert item["deadline"] is None
+    assert item["task"] == "Ship the release"
+    assert len(provider.calls) == 2
+
+
+def test_hallucinated_owner_is_nulled_when_retry_also_fails(settings):
+    provider = FakeAnalysisProvider([valid_analysis(owner="Pratap")])
+    analysis = MeetingSummarizer(settings, provider=provider).analyze(
+        "The customer will send the data."
+    )
+    assert analysis["action_items"][0]["owner"] is None
+
+
+def test_grounded_owner_is_kept(settings):
+    provider = FakeAnalysisProvider([valid_analysis(owner="Pratap")])
+    analysis = MeetingSummarizer(settings, provider=provider).analyze(
+        "Pratap will prepare the report."
+    )
+    assert analysis["action_items"][0]["owner"] == "Pratap"
+
+
+def test_grounded_owner_recovered_on_retry(settings):
+    provider = FakeAnalysisProvider(
+        [valid_analysis(owner="Pratap"), valid_analysis(owner=None)]
+    )
+    analysis = MeetingSummarizer(settings, provider=provider).analyze(
+        "The customer will send the data."
+    )
+    assert analysis["action_items"][0]["owner"] is None
+    assert len(provider.calls) == 2

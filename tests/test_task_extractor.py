@@ -8,6 +8,9 @@ import pytest
 
 from ai.task_extractor import (
     AnalysisValidationError,
+    deadline_is_plausible,
+    downgrade_ungrounded,
+    find_grounding_issues,
     parse_model_json,
     validate_analysis,
 )
@@ -115,3 +118,88 @@ def test_transcript_injection_is_data_not_instruction():
     analysis = valid_analysis(overview=injection)
     validated = validate_analysis(analysis)
     assert validated["overview"] == injection
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [
+        "Friday",
+        "friday 5pm",
+        "Thursday afternoon",
+        "गुरुवार दोपहर",
+        "next week",
+        "month-end",
+        "end of sprint",
+        "2026-03-02",
+        "2 March",
+        "March 2, 2026",
+        "tomorrow",
+        "2/3",
+    ],
+)
+def test_plausible_deadlines_are_accepted(deadline):
+    assert deadline_is_plausible(deadline)
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [
+        "2-2 March",
+        "2/2",
+        "42 March",
+        "99 January",
+        "banana",
+        "soon-ish maybe",
+    ],
+)
+def test_implausible_deadlines_are_rejected(deadline):
+    assert not deadline_is_plausible(deadline)
+
+
+def test_implausible_deadline_is_reported_as_sanity_issue():
+    analysis = valid_analysis(deadline="2-2 March")
+    validated = validate_analysis(analysis)
+    issues = find_grounding_issues(validated, "We agreed to ship the release.")
+    assert any("2-2 March" in issue for issue in issues)
+
+
+def test_transcript_corrupted_deadline_is_reported():
+    # HI03: spoken "गुरुवार दोपहर" was mis-transcribed as "do-do March".
+    analysis = valid_analysis(deadline="do-do March")
+    validated = validate_analysis(analysis)
+    issues = find_grounding_issues(validated, "We agreed to ship the release.")
+    assert len(issues) == 1
+
+
+def test_grounded_owner_produces_no_issues():
+    analysis = valid_analysis(owner="Pratap")
+    issues = find_grounding_issues(analysis, "Pratap will prepare the report.")
+    assert issues == []
+
+
+def test_hallucinated_owner_is_reported():
+    analysis = valid_analysis(owner="Pratap")
+    issues = find_grounding_issues(analysis, "The customer will send the data.")
+    assert issues == [
+        "action item 1 owner 'Pratap' does not appear in the transcript; "
+        "use null if the owner is not stated"
+    ]
+
+
+def test_downgrade_ungrounded_nulls_owner_and_deadline_but_keeps_task():
+    analysis = valid_analysis(owner="Pratap", deadline="2-2 March")
+    downgraded = downgrade_ungrounded(analysis, "The customer will send the data.")
+    item = downgraded["action_items"][0]
+    assert item["owner"] is None
+    assert item["deadline"] is None
+    assert item["task"] == "Ship the release"
+    # The original analysis is not mutated.
+    assert analysis["action_items"][0]["owner"] == "Pratap"
+
+
+def test_downgrade_keeps_grounded_fields():
+    analysis = valid_analysis(owner="Pratap", deadline="Friday")
+    downgraded = downgrade_ungrounded(analysis, "Pratap agreed to ship on Friday.")
+    item = downgraded["action_items"][0]
+    assert item["owner"] == "Pratap"
+    assert item["deadline"] == "Friday"

@@ -173,6 +173,11 @@ class Settings:
     groq_model: str = ""
     groq_timeout: float = 60.0
 
+    # Optional language hint for the Sarvam batch transcription API
+    # (TEAMMEETINGAI_SARVAM_LANGUAGE_HINT, BCP-47 such as "hi-IN" or
+    # "en-IN").  Empty means auto-detect, which is the default behaviour.
+    sarvam_language_hint: str = ""
+
     # Local LLM (Ollama).  Reserved for a future local analysis backend.
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
@@ -265,6 +270,9 @@ def load_settings() -> Settings:
         allow_cloud_analysis=_bool_env("TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS"),
         groq_model=os.environ.get("TEAMMEETINGAI_GROQ_MODEL", ""),
         groq_timeout=_float_env("TEAMMEETINGAI_GROQ_TIMEOUT", 60.0),
+        sarvam_language_hint=os.environ.get(
+            "TEAMMEETINGAI_SARVAM_LANGUAGE_HINT", ""
+        ).strip(),
         ollama_host=os.environ.get(
             "TEAMMEETINGAI_OLLAMA_HOST", "http://localhost:11434"
         ),

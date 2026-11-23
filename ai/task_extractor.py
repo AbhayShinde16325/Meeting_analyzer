@@ -7,8 +7,10 @@ shown or stored.  Missing owners, deadlines, and evidence are kept as
 
 from __future__ import annotations
 
+import copy
 import json
 import re
+import unicodedata
 from typing import Any, Mapping
 
 _LIST_FIELDS = (
@@ -29,9 +31,73 @@ _UNKNOWN_VALUES = {
     "-",
 }
 
+# Tokens that make a deadline string date-like: weekdays (English, common
+# Hindi transliterations, and Devanagari), months, relative terms, and
+# dayparts.  ASR noise inside a transcript frequently invents deadlines
+# (for example "2-2 March" from mis-heard speech), so anything without one
+# of these tokens is treated as implausible and rejected.
+_WEEKDAY_TOKENS = (
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "somwar", "somvaar", "mangalwar", "budhwar", "guruwar", "guruvaar",
+    "shukrawar", "shukravaar", "shaniwar", "shanivaar", "sanichar", "sanivar",
+    "ravivar", "ravivaar",
+    "रविवार", "सोमवार", "मंगलवार", "बुधवार", "गुरुवार", "शुक्रवार", "शनिवार",
+)
+_MONTH_TOKENS = (
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+    "oct", "nov", "dec",
+)
+_RELATIVE_TOKENS = (
+    "today", "tomorrow", "yesterday", "kal", "aaj", "parso",
+    "week", "weeks", "weekend", "month", "months", "quarter", "sprint",
+)
+_DAYPART_TOKENS = (
+    "morning", "afternoon", "evening", "tonight", "night", "noon",
+    "subah", "dopahar", "shaam", "raat",
+    "सुबह", "दोपहर", "शाम", "रात",
+)
+_DATE_TOKENS = frozenset(
+    _WEEKDAY_TOKENS + _MONTH_TOKENS + _RELATIVE_TOKENS + _DAYPART_TOKENS
+)
+# Duplicated tokens ("2-2 March", or the word-duplication form "do-do
+# March" produced when Hindi speech is mis-transcribed) are classic
+# ASR-corruption artefacts.  The word pattern uses \w plus the Devanagari
+# range because Python's \w does not match combining matras.
+_DUPLICATED_NUMBER_RE = re.compile(r"\b(\d{1,2})\s*[-–/]\s*\1\b")
+_DUPLICATED_WORD_RE = re.compile(r"\b(\w{1,6})\s*[-–]\s*\1\b")
+_NUMERIC_DATE_RE = re.compile(r"\b\d{1,4}\s*[-/.]\s*\d{1,2}(?:\s*[-/.]\s*\d{1,4})?\b")
+_NUMBER_RE = re.compile(r"\d{1,4}")
+# Devanagari combining marks (matras) are category Mn and are excluded from
+# \w by the re module, so the range is added explicitly.
+_WORD_RE = re.compile(r"[\w\u0900-\u097F]+", re.UNICODE)
+
 
 class AnalysisValidationError(ValueError):
     """Raised when a model response does not match the expected schema."""
+
+
+def deadline_is_plausible(deadline: str) -> bool:
+    """Whether a deadline string looks like an actual date expression.
+
+    This is deliberately a sanity check, not a parser: it catches ASR- or
+    model-corrupted values (duplicated or out-of-range numbers, phrases with
+    no date meaning at all) while accepting every reasonable human form,
+    including Hindi words in either script.
+    """
+
+    text = unicodedata.normalize("NFKC", str(deadline)).casefold()
+    if _DUPLICATED_NUMBER_RE.search(text) or _DUPLICATED_WORD_RE.search(text):
+        return False
+    for match in _NUMBER_RE.finditer(text):
+        value = int(match.group())
+        if value > 31 and not 1000 <= value <= 2999:
+            return False
+    if _NUMERIC_DATE_RE.search(text):
+        return True
+    words = set(_WORD_RE.findall(text))
+    return bool(words & _DATE_TOKENS)
 
 
 def parse_model_json(raw: str | Mapping[str, Any]) -> Mapping[str, Any]:
@@ -111,13 +177,14 @@ def validate_analysis(data: Mapping[str, Any]) -> dict[str, Any]:
             raise AnalysisValidationError(
                 f"Action item {index} is missing a task description."
             )
+        deadline = _optional_text(
+            raw_item.get("deadline"), f"action item {index} deadline"
+        )
         action_items.append(
             {
                 "task": task.strip(),
                 "owner": _optional_text(raw_item.get("owner"), f"action item {index} owner"),
-                "deadline": _optional_text(
-                    raw_item.get("deadline"), f"action item {index} deadline"
-                ),
+                "deadline": deadline,
                 "evidence": _optional_text(
                     raw_item.get("evidence"), f"action item {index} evidence"
                 ),
@@ -125,6 +192,70 @@ def validate_analysis(data: Mapping[str, Any]) -> dict[str, Any]:
         )
     normalised["action_items"] = action_items
     return normalised
+
+
+def find_grounding_issues(
+    analysis: Mapping[str, Any], transcript_text: str
+) -> list[str]:
+    """Describe action items with invented or implausible details.
+
+    The system prompt forbids invented owners and deadlines, but ASR-corrupted
+    transcripts can still lead the model to hallucinate them (an owner name
+    that occurs nowhere in the transcript, or a corrupted date such as
+    "2-2 March").  Sanity issues are reported instead of raising so the
+    caller can retry and finally downgrade the offending fields to null.
+    """
+
+    transcript = unicodedata.normalize("NFKC", transcript_text).casefold()
+    issues: list[str] = []
+    for index, item in enumerate(analysis.get("action_items", []), start=1):
+        if not isinstance(item, Mapping):
+            continue
+        owner = item.get("owner")
+        if owner and not _text_present(str(owner), transcript):
+            issues.append(
+                f"action item {index} owner '{owner}' does not appear in "
+                "the transcript; use null if the owner is not stated"
+            )
+        deadline = item.get("deadline")
+        if deadline and not deadline_is_plausible(str(deadline)):
+            issues.append(
+                f"action item {index} deadline '{deadline}' is not a "
+                "plausible date; extract only dates explicitly agreed in "
+                "the transcript; use null otherwise"
+            )
+    return issues
+
+
+def downgrade_ungrounded(
+    analysis: Mapping[str, Any], transcript_text: str
+) -> dict[str, Any]:
+    """Return a copy with ungrounded owners and implausible deadlines nulled.
+
+    Used after retries are exhausted: keeping the action item without its
+    invented owner or corrupted deadline is better than losing the analysis.
+    """
+
+    transcript = unicodedata.normalize("NFKC", transcript_text).casefold()
+    downgraded = copy.deepcopy(dict(analysis))
+    for item in downgraded.get("action_items", []):
+        owner = item.get("owner")
+        if owner and not _text_present(str(owner), transcript):
+            item["owner"] = None
+        deadline = item.get("deadline")
+        if deadline is not None and not deadline_is_plausible(deadline):
+            item["deadline"] = None
+    return downgraded
+
+
+def _text_present(text: str, transcript: str) -> bool:
+    normalised = unicodedata.normalize("NFKC", text).casefold().strip()
+    if normalised and normalised in transcript:
+        return True
+    return any(
+        len(word) >= 3 and word in transcript
+        for word in _WORD_RE.findall(normalised)
+    )
 
 
 def _validate_string_list(value: Any, field_name: str) -> list[str]:
