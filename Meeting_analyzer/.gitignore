@@ -1,0 +1,21 @@
+# Secrets - never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environment
+.venv/
+
+# Local scratch PostgreSQL cluster used by tests
+.pytest_pg/
+
+# Command Code local tool state
+.commandcode/
+
+# Database dumps produced by scripts/backup_database.py
+backups/
+golden_audio_synthetic/
+scratch_*.log

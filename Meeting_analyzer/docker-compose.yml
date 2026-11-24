@@ -1,0 +1,30 @@
+# TeamMeetingAI database.
+#
+# This stack provisions PostgreSQL only. The FastAPI server and the desktop
+# client run on the host machine (audio capture is local; see README.md),
+# so `docker compose up -d db` is all the infrastructure the app needs.
+#
+# Credentials come from the project-root .env file (compose interpolation).
+# Run scripts\setup.ps1 to generate .env with safe values.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tma-postgres
+    environment:
+      POSTGRES_USER: ${TEAMMEETINGAI_PG_USER:-tma}
+      POSTGRES_PASSWORD: ${TEAMMEETINGAI_PG_PASSWORD:?set TEAMMEETINGAI_PG_PASSWORD in .env}
+      POSTGRES_DB: ${TEAMMEETINGAI_PG_DB:-teammeetingai}
+    ports:
+      - "${TEAMMEETINGAI_PG_PORT:-5433}:5432"
+    volumes:
+      - tma-pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEAMMEETINGAI_PG_USER:-tma} -d ${TEAMMEETINGAI_PG_DB:-teammeetingai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  tma-pgdata:

@@ -1,0 +1,17 @@
+.git
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.venv
+venv
+node_modules
+client/node_modules
+client/dist
+dist
+build
+Meeting_analyzer/.env
+.env
+*.log
+tmp
+graphify-out

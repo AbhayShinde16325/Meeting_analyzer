@@ -14,6 +14,8 @@ from sqlalchemy import text
 from api import errors
 from api.deps import ConnDep
 from api.schemas import ActionItemOut, ActionItemPatch, JobOut, SummaryOut
+from config import load_settings
+from ai.provider_factory import build_analysis_provider, ProviderConfigurationError
 
 router = APIRouter(prefix="/meetings", tags=["summaries"])
 action_router = APIRouter(prefix="/action-items", tags=["summaries"])
@@ -55,6 +57,18 @@ def analyse(
     if primary is None:
         raise errors.bad_request(
             "no_transcript", "Transcribe the meeting before requesting analysis."
+        )
+    settings = load_settings()
+    try:
+        provider = build_analysis_provider(settings)
+    except ProviderConfigurationError as exc:
+        raise errors.bad_request("analysis_not_configured", str(exc))
+    except Exception as exc:
+        raise errors.bad_request("analysis_not_configured", f"Analysis backend unavailable: {exc}")
+    if provider is None:
+        raise errors.bad_request(
+            "analysis_not_configured",
+            "No analysis backend configured. Set TEAMMEETINGAI_ANALYSIS_BACKEND=groq, TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS=1, TEAMMEETINGAI_GROQ_MODEL, and TEAMMEETINGAI_GROQ_API_KEY.",
         )
     active = conn.execute(
         text(

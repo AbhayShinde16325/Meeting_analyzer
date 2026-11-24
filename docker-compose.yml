@@ -1,11 +1,9 @@
-# TeamMeetingAI database.
+# TeamMeetingAI: Postgres + unified FastAPI server serving React client
+# Usage:
+#   cp .env.example .env  # fill required values
+#   docker compose up --build
 #
-# This stack provisions PostgreSQL only. The FastAPI server and the desktop
-# client run on the host machine (audio capture is local; see README.md),
-# so `docker compose up -d db` is all the infrastructure the app needs.
-#
-# Credentials come from the project-root .env file (compose interpolation).
-# Run scripts\setup.ps1 to generate .env with safe values.
+# App: http://localhost:${TEAMMEETINGAI_APP_PORT:-8000}
 
 services:
   db:
@@ -25,6 +23,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: /api
+    container_name: tma-app
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${TEAMMEETINGAI_PG_USER:-tma}:${TEAMMEETINGAI_PG_PASSWORD:?set TEAMMEETINGAI_PG_PASSWORD in .env}@db:5432/${TEAMMEETINGAI_PG_DB:-teammeetingai}
+      TEAMMEETINGAI_API_HOST: 0.0.0.0
+      TEAMMEETINGAI_API_PORT: 8000
+      TEAMMEETINGAI_STATIC_DIR: /app/client-dist
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${TEAMMEETINGAI_APP_PORT:-8000}:8000"
+    restart: unless-stopped
 
 volumes:
   tma-pgdata:
