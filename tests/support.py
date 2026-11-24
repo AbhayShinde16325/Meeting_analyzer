@@ -19,20 +19,9 @@ def wait_until(
     timeout: float = 10.0,
     interval: float = 0.02,
 ) -> bool:
-    """Pump the Qt event loop until ``predicate`` is true (UI worker joins).
-
-    QThread workers deliver their ``completed`` signals through queued
-    connections, so tests must let the event loop run between thread
-    completion and slot execution.  Returns False on timeout.
-    """
-
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication.instance()
+    """Poll until predicate is true; returns False on timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if app is not None:
-            app.processEvents()
         if predicate():
             return True
         time.sleep(interval)

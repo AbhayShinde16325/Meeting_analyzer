@@ -14,12 +14,16 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from pathlib import Path
 import time
 import uuid
 from typing import Iterator
 
-from fastapi import Depends, FastAPI, Query
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api import errors
 from api.deps import ConnDep
@@ -65,7 +69,24 @@ def build_app() -> FastAPI:
             "been obtained by the operator."
         ),
     )
+    allowed_origins = [
+        origin.strip()
+        for origin in os.environ.get(
+            "TEAMMEETINGAI_CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
+        ).split(",")
+        if origin.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition", "Content-Length", "X-File-SHA256"],
+    )
     errors.register_error_handlers(app)
+    _install_api_path_compat(app)
 
     app.include_router(health.router)
     app.include_router(users.router)
@@ -81,6 +102,7 @@ def build_app() -> FastAPI:
     app.include_router(speakers.profiles_router)
     app.include_router(system.router)
     _include_export(app)
+    _mount_static_client(app)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> Iterator[dict]:
@@ -202,6 +224,50 @@ def _build_speaker_profiler(engine):
         if problem:
             logger.warning("%s Profiling jobs will fail until it is fixed.", problem)
     return profiler
+
+
+def _install_api_path_compat(app: FastAPI) -> None:
+    """Allow frontend to call /api/* while keeping existing API paths."""
+
+    class _ApiPrefixMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            path = request.scope.get("path", "")
+            if path == "/api":
+                request.scope["path"] = "/"
+            elif path.startswith("/api/"):
+                request.scope["path"] = path[4:] or "/"
+            return await call_next(request)
+
+    app.add_middleware(_ApiPrefixMiddleware)
+
+
+def _mount_static_client(app: FastAPI) -> None:
+    """Serve built React client when TEAMMEETINGAI_STATIC_DIR is set."""
+
+    static_dir = os.environ.get("TEAMMEETINGAI_STATIC_DIR", "").strip()
+    if not static_dir:
+        return
+    root = Path(static_dir)
+    if not root.exists():
+        logger.warning("Static client dir %s does not exist; API-only mode.", root)
+        return
+    assets = root / "assets"
+    if assets.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
+
+    index_file = root / "index.html"
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str):
+        # Do not swallow unknown API routes.
+        if full_path.startswith("api/") or full_path == "api":
+            raise errors.not_found("not_found", "Not found.")
+        candidate = (root / full_path).resolve()
+        if full_path and candidate.is_file() and str(candidate).startswith(str(root.resolve())):
+            return FileResponse(candidate)
+        if index_file.exists():
+            return FileResponse(index_file)
+        raise errors.not_found("not_found", "Not found.")
 
 
 def main() -> None:  # pragma: no cover - manual entry point

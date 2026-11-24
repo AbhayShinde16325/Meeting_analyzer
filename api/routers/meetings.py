@@ -18,7 +18,7 @@ from sqlalchemy import text
 from api import errors
 from api.deps import ConnDep, ProfileDep, require_host
 from api.schemas import MeetingOut
-from services.ingest import IngestError, ingest_recording
+from services.ingest import IngestError, ingest_recording, ingest_multi_source_recording, normalize_uploaded_audio
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -105,12 +105,19 @@ def create_meeting(
     ).scalar_one_or_none() is None:
         raise errors.not_found("profile_not_found", "Unknown profile.")
 
-    # Spool the upload to a temp file so ingest can stream it into a Large
-    # Object without holding multi-GB recordings in memory.
+    # Spool upload to disk to avoid holding large audio in memory.
+    raw_name = file.filename or "recording"
+    suffix = Path(raw_name).suffix.lower()
+    if not suffix:
+        ct = (file.content_type or "").lower()
+        suffix = {
+            "audio/webm": ".webm", "video/webm": ".webm", "audio/ogg": ".ogg",
+            "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a", "audio/wav": ".wav", "audio/x-wav": ".wav",
+            "audio/flac": ".flac",
+        }.get(ct.split(";")[0].strip(), ".upload")
     with tempfile.TemporaryDirectory(prefix="tma-upload-") as temp_dir:
-        target = tempfile.NamedTemporaryFile(
-            dir=temp_dir, suffix=".wav", delete=False
-        )
+        target = tempfile.NamedTemporaryFile(dir=temp_dir, suffix=suffix, delete=False)
         try:
             uploaded_bytes = 0
             while chunk := file.file.read(4 * 1024 * 1024):
@@ -118,9 +125,7 @@ def create_meeting(
                 target.write(chunk)
             target.close()
             if uploaded_bytes <= 44:
-                raise errors.bad_request(
-                    "empty_recording", "The uploaded recording is empty."
-                )
+                raise errors.bad_request("empty_recording", "The uploaded recording is empty.")
             try:
                 meeting_id = ingest_recording(
                     conn,
@@ -130,19 +135,18 @@ def create_meeting(
                     duration_ms=duration_ms,
                     sample_rate=sample_rate,
                     channels=channels,
-                    original_filename=file.filename or "recording.wav",
+                    mime_type=file.content_type or "application/octet-stream",
+                    original_filename=raw_name,
                 )
             except IngestError as exc:
                 raise errors.bad_request("ingest_failed", str(exc)) from exc
             if notes is not None:
-                conn.execute(
-                    text("UPDATE meetings SET notes = :n WHERE id = :m"),
-                    {"n": notes, "m": uuid.UUID(meeting_id)},
-                )
+                conn.execute(text("UPDATE meetings SET notes = :n WHERE id = :m"), {"n": notes, "m": uuid.UUID(meeting_id)})
         finally:
-            import os
-
-            os.unlink(target.name)
+            try:
+                Path(target.name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     row = (
         conn.execute(
@@ -176,6 +180,76 @@ def get_meeting(meeting_id: uuid.UUID, conn: ConnDep) -> dict:
     return dict(row)
 
 
+@router.post("/multi-source", response_model=MeetingOut, status_code=201)
+def create_multi_source_meeting(
+    profile: ProfileDep,
+    _: Annotated[None, Depends(require_host)],
+    conn: ConnDep,
+    title: Annotated[str, Form(min_length=1, max_length=300)],
+    user_id: Annotated[uuid.UUID | None, Form()] = None,
+    notes: Annotated[str | None, Form(max_length=4000)] = None,
+    duration_ms: Annotated[int, Form(ge=0)] = 0,
+    source_manifest: Annotated[str | None, Form()] = None,
+    microphone: Annotated[UploadFile | None, File()] = None,
+    system: Annotated[UploadFile | None, File()] = None,
+    browser: Annotated[UploadFile | None, File()] = None,
+    mixed: Annotated[UploadFile | None, File()] = None,
+) -> dict:
+    """Host-only: ingest synchronized multi-source recording."""
+    effective_user = user_id or profile.get("id")
+    if effective_user is None:
+        raise errors.bad_request("user_required", "Select or create a profile before recording.")
+    if conn.execute(text("SELECT 1 FROM users WHERE id = :id"), {"id": effective_user}).scalar_one_or_none() is None:
+        raise errors.not_found("profile_not_found", "Unknown profile.")
+
+    uploads = [("microphone", microphone), ("system", system), ("browser", browser), ("mixed", mixed)]
+    uploads = [(n, f) for n, f in uploads if f is not None]
+    if not uploads:
+        raise errors.bad_request("missing_audio", "Provide at least one audio source.")
+
+    import json
+    manifest = {}
+    if source_manifest:
+        try:
+            manifest = json.loads(source_manifest)
+        except json.JSONDecodeError:
+            raise errors.bad_request("invalid_manifest", "source_manifest must be valid JSON.")
+
+    with tempfile.TemporaryDirectory(prefix="tma-multi-") as temp_dir:
+        sources: dict[str, Path] = {}
+        meta: dict[str, dict] = {}
+        try:
+            for name, uf in uploads:
+                raw_name = uf.filename or f"{name}.webm"
+                suffix = Path(raw_name).suffix.lower() or ".upload"
+                target = tempfile.NamedTemporaryFile(dir=temp_dir, suffix=suffix, delete=False)
+                size = 0
+                while chunk := uf.file.read(4 * 1024 * 1024):
+                    size += len(chunk)
+                    target.write(chunk)
+                target.close()
+                if size <= 44:
+                    raise errors.bad_request("empty_recording", f"Source '{name}' is empty.")
+                sources[name] = Path(target.name)
+                meta[name] = {"original_filename": raw_name, "mime_type": uf.content_type or "application/octet-stream", **(manifest.get(name, {}) if isinstance(manifest.get(name), dict) else {})}
+            try:
+                meeting_id = ingest_multi_source_recording(
+                    conn, user_id=str(effective_user), title=title, sources=sources, source_meta=meta, duration_ms=duration_ms, notes=notes
+                )
+            except IngestError as exc:
+                raise errors.bad_request("ingest_failed", str(exc)) from exc
+        finally:
+            for p in sources.values():
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    row = conn.execute(text(
+        "SELECT id, user_id, title, status, recorded_at, duration_ms, language, notes FROM meetings WHERE id = :id"
+    ), {"id": meeting_id}).mappings().one()
+    return dict(row)
+
+
 @router.delete("/{meeting_id}", status_code=204)
 def delete_meeting(
     _: Annotated[None, Depends(require_host)],
@@ -183,13 +257,7 @@ def delete_meeting(
     conn: ConnDep,
     profile: ProfileDep,
 ) -> None:
-    """Host-only, permanent deletion (no soft delete, no retention period).
-
-    Deleting the meeting cascades to transcripts, summaries, action items,
-    attachments and job history; the ``meeting_files`` trigger unlinks each
-    Large Object in the same transaction.  Backups taken before this deletion
-    keep the removed data until they expire.
-    """
+    """Host-only, permanent deletion (no soft delete, no retention period)."""
 
     result = conn.execute(
         text("DELETE FROM meetings WHERE id = :id"), {"id": meeting_id}

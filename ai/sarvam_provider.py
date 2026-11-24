@@ -127,13 +127,11 @@ class SarvamTranscriptionProvider:
             "mode": self.transcript_mode,
             "with_diarization": True,
         }
-        # Optional language hint (BCP-47, e.g. "hi-IN") for audio that the
-        # auto-detector reliably misdetects (Hinglish code-switching).
+        # Automatic language detection by default for Hindi/English/Hinglish.
+        # Optional hint only when explicitly configured.
         hint = (self._settings.sarvam_language_hint or "").strip()
         if hint:
             params["language_code"] = hint
-        # Optional speaker-count hint for diarization: fixes
-        # over-segmentation where one person is reported as several labels.
         num_speakers = int(self._settings.sarvam_num_speakers or 0)
         if num_speakers > 0:
             params["num_speakers"] = num_speakers
@@ -246,14 +244,16 @@ class SarvamTranscriptionProvider:
                 except (TypeError, ValueError):
                     start, end = 0.0, 0.0
                 speaker = entry.get("speaker_id")
-                segments.append(
-                    {
-                        "start": max(0.0, start),
-                        "end": max(0.0, end),
-                        "text": entry_text,
-                        "speaker": f"Speaker {speaker}" if speaker is not None else None,
-                    }
-                )
+                seg = {
+                    "start": max(0.0, start),
+                    "end": max(0.0, end),
+                    "text": entry_text,
+                    "speaker": f"Speaker {speaker}" if speaker is not None else None,
+                }
+                for k in ("language_code", "language", "confidence", "score"):
+                    if entry.get(k) is not None:
+                        seg["confidence" if k == "score" else k] = entry.get(k)
+                segments.append(seg)
         if not segments:
             timestamps = payload.get("timestamps") or {}
             chunks = timestamps.get("chunks") or []

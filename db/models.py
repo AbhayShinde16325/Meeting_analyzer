@@ -52,7 +52,8 @@ ATTACHMENT_MIME_TYPES = (
 )
 
 AUDIO_KINDS = ("original_audio_48k", "derived_audio_16k")
-FILE_KINDS = AUDIO_KINDS + ("attachment",)
+SOURCE_AUDIO_KINDS = ("source_microphone", "source_system", "source_browser", "mixed_master")
+FILE_KINDS = AUDIO_KINDS + SOURCE_AUDIO_KINDS + ("attachment",)
 MEETING_STATUSES = ("recording", "recorded", "transcribed", "analyzing", "completed", "failed")
 JOB_TYPES = ("transcription", "analysis", "profiling")
 JOB_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
@@ -124,6 +125,8 @@ class Meeting(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     language: Mapped[str | None] = mapped_column(String(32), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    capture_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    capture_manifest: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class MeetingFile(Base):

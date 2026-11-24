@@ -255,6 +255,55 @@ class SpeakerProfileService:
             self._encoder = get_encoder()
         return self._encoder
 
+    def enroll_profile_audio(self, *, profile_id: str, audio_path: Path) -> dict[str, Any]:
+        """Enroll a user-provided voice sample into an existing profile.
+
+        Uses the same encoder and stores an embedding as a confirmed profile
+        embedding (profile_id set). No diarization/meeting transcript is required.
+        """
+        if not self.enabled:
+            raise SpeakerProfilingError(
+                "Voice profiling is disabled. Set TEAMMEETINGAI_VOICE_PROFILING=1 and install resemblyzer."
+            )
+        with self._engine.begin() as conn:
+            exists = conn.execute(text("SELECT id, display_name FROM speaker_profiles WHERE id=:p"), {"p": profile_id}).mappings().one_or_none()
+            if exists is None:
+                raise SpeakerProfilingError("Speaker profile not found.")
+        encoder = self._get_encoder()
+        # Reuse preprocess/embed from encoder; require enough speech.
+        from resemblyzer import preprocess_wav
+        wav = preprocess_wav(str(audio_path))
+        sample_rate = 16000
+        seconds = len(wav) / sample_rate if len(wav) else 0.0
+        if seconds < self._settings.voice_min_segment_seconds:
+            raise SpeakerProfilingError(
+                f"Enrollment sample too short ({seconds:.1f}s). Provide at least {self._settings.voice_min_segment_seconds:.0f}s of clean speech."
+            )
+        # Quality guard: avoid near-silent samples.
+        if float(np.sqrt(np.mean(np.square(wav)))) < 0.01:
+            raise SpeakerProfilingError("Enrollment sample appears too quiet/noisy. Please record a clearer sample.")
+        embedding = encoder._encoder.embed_utterance(wav).tolist()
+        with self._engine.begin() as conn:
+            # Store as a synthetic enrollment embedding. meeting_id/transcript_id/local_label are required by schema;
+            # we create a hidden enrollment transcript/meeting-less linkage is not possible, so attach to a synthetic
+            # enrollment meeting owned by no user? Instead, create enrollment rows in a lightweight way by using a
+            # dedicated enrollment meeting/transcript per profile sample.
+            user_id = conn.execute(text("SELECT id FROM users ORDER BY created_at LIMIT 1")).scalar_one_or_none()
+            if user_id is None:
+                raise SpeakerProfilingError("Create a user/profile before enrolling speaker voice samples.")
+            meeting_id = conn.execute(text(
+                "INSERT INTO meetings (id, user_id, title, status) VALUES (gen_random_uuid(), :u, :t, 'completed') RETURNING id"
+            ), {"u": user_id, "t": f"Voice enrollment: {exists['display_name']}"}).scalar_one()
+            transcript_id = conn.execute(text(
+                "INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, text, segments) "
+                "VALUES (gen_random_uuid(), :m, 'enrollment', 'resemblyzer-ge2e', false, :txt, CAST(:seg AS jsonb)) RETURNING id"
+            ), {"m": meeting_id, "txt": "Voice enrollment sample", "seg": _json([{"start":0.0,"end":round(seconds,3),"text":"enrollment","speaker":"Enrollment"}])}).scalar_one()
+            conn.execute(text(
+                "INSERT INTO speaker_embeddings (id, meeting_id, transcript_id, local_label, embedding, source_seconds, profile_id) "
+                "VALUES (gen_random_uuid(), :m, :t, 'Enrollment', CAST(:e AS jsonb), :s, :p)"
+            ), {"m": meeting_id, "t": transcript_id, "e": _json(embedding), "s": float(seconds), "p": profile_id})
+        return {"profile_id": profile_id, "display_name": exists["display_name"], "seconds": round(seconds,3), "embedding_count": self.profile_embedding_count(profile_id)}
+
     @property
     def enabled(self) -> bool:
         return bool(self._settings.voice_profiling_enabled)

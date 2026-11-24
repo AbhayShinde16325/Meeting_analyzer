@@ -7,7 +7,7 @@ employees who attend Google Meet meetings.
 
 The product began as a local-only desktop app and has been migrated to a
 small **hosted deployment**: one machine (the *host*) runs a FastAPI server
-with a PostgreSQL database, while the PySide6 desktop client talks to it over
+with a PostgreSQL database, while the React client in `client/` talks to it over
 HTTP. The host machine captures meeting audio; transcription and analysis run
 server-side against cloud APIs (Sarvam Saaras v4 for transcription, Groq for
 meeting analysis).
@@ -15,7 +15,7 @@ meeting analysis).
 ### Current architecture goals
 
 - Run the FastAPI server + PostgreSQL on the host computer (LAN-only).
-- PySide6 desktop client for recording and browsing meetings, communicating
+- React web client for recording, browsing, and managing meetings, communicating
   with the server exclusively through the HTTP API.
 - Manual start and stop for every recording.
 - Hosted PostgreSQL persistence including meeting audio as Large Objects.
@@ -43,11 +43,11 @@ meeting analysis).
 | Area | Technology |
 | --- | --- |
 | Language | Python 3.11 |
-| Desktop UI | PySide6 |
+| Frontend UI | React + Vite (`client/`) |
 | Microphone capture | SoundCard (client side) |
 | System audio | Windows WASAPI loopback (client side) |
 | API | FastAPI + uvicorn (`api/`) |
-| HTTP client | httpx (`client/api_client.py`) |
+| HTTP client | httpx (`integrations/api_client.py`) |
 | Database | PostgreSQL (Large Objects for audio) |
 | Database access | SQLAlchemy 2.0 |
 | Migrations | Alembic (`db/migrations/`) |
@@ -62,9 +62,9 @@ isolated to the client's `audio/` package.
 
 Keep the application modular:
 
-- `ui/`: PySide6 windows and widgets. Never touches the database, files, or
-  audio logic directly — everything goes through `client/api_client.py`.
-- `client/`: the single HTTP client wrapper (`TeamMeetingAIClient`), error
+- `client/`: React frontend. Never touches the database directly;
+  it uses FastAPI endpoints through `/api` proxy.
+- `integrations/`: backend-side HTTP integration wrapper (`TeamMeetingAIClient`), error
   types, host-token header handling.
 - `api/`: FastAPI app, routers (`meetings`, `files`, `transcripts`,
   `summaries`, `jobs`, `search`, `users`, `system`, `health`), Pydantic
@@ -232,8 +232,8 @@ Test tiers (see `tests/conftest.py`):
 - PostgreSQL tier (`db_schema`, `lo_lifecycle`, `api`, `ingest_pipeline`,
   `ui_smoke`) — opt-in via `TEST_DATABASE_URL`; the harness creates a fresh
   scratch database, migrates to head, and truncates between tests.
-- UI tests drive real PySide6 windows against a live uvicorn server with
-  faked providers (`tests/ui_server.py`).
+- API/frontend smoke tests validate FastAPI routes and React build contracts with
+  faked providers where needed.
 
 Minimum test areas: schema and LO lifecycle, API behavior and error
 envelopes, ingestion/processing pipeline, provider fallback provenance,

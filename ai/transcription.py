@@ -228,5 +228,16 @@ def _normalise_segments(
         speaker = raw.get("speaker")
         if isinstance(speaker, str) and speaker.strip():
             entry["speaker"] = speaker.strip()
+        for k in ("language", "language_code", "confidence"):
+            v = raw.get(k)
+            if v is None:
+                continue
+            if k == "confidence":
+                try:
+                    entry[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+            elif isinstance(v, str) and v.strip():
+                entry[k] = v.strip()
         normalised.append(entry)
     return normalised

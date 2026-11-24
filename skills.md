@@ -4,8 +4,8 @@ This file defines reusable, project-specific skills for contributors and
 coding agents. These are workflow guides, not external services or claims
 that a particular tool is already installed.
 
-The project is a **client-server application**: a PySide6 desktop client
-(`ui/`, `client/`, `audio/`) talks HTTP to a FastAPI server (`api/`,
+The project is a **web application**: a React frontend
+(`client/`) talks HTTP to a FastAPI backend (`Meeting_analyzer/api/`,
 `services/`, `db/`, `ai/`) with a PostgreSQL database. Keep that boundary in
 mind in every skill below.
 
@@ -25,7 +25,7 @@ safely on stop (`audio/recorder.py`). 6. Verify duration, sample rate
 (48 kHz), channels, and file integrity before upload. 7. Handle unavailable
 devices and capture errors without leaving a false recording state.
 
-**Rules:** - Do not block the PySide6 main thread. - Provide clear recording
+**Rules:** - Do not block the UI thread. - Provide clear recording
 state and elapsed-time feedback. - Close audio streams and finalize files on
 stop, cancellation, and exceptions. - Avoid hard-coded device indexes. -
 Consider echo and feedback; recommend headphones. - Never claim a recording
@@ -39,7 +39,7 @@ finalized files are valid; errors are visible and recoverable.
 **Purpose:** Move a finished recording from the client into the server's
 PostgreSQL store and start processing.
 
-**Use when:** Changing the upload flow (`client/api_client.py`,
+**Use when:** Changing the upload flow (`integrations/api_client.py`,
 `api/routers/meetings.py`, `services/ingest.py`). Debugging "upload failed"
 or missing audio tracks.
 
@@ -162,29 +162,25 @@ report validation errors instead of storing malformed results.
 **Acceptance criteria:** Output conforms to the schema; missing information
 is explicit; re-analysis never leaves stale items behind.
 
-## Skill 6: PySide6 API-Backed Desktop UI (client)
+## Skill 6: React API-Backed Frontend (`client/`)
 
-**Purpose:** Build the employee-facing desktop client on top of the HTTP
+**Purpose:** Build the employee-facing web client on top of the HTTP
 API.
 
 **Use when:** Creating or changing login, dashboard, recorder, or meeting
 detail screens. Connecting UI controls to background work.
 
-**Core screens:** 1. Profile selection (`ui/login.py`). 2. Dashboard with
-meeting list and search (`ui/dashboard.py`). 3. Recording controls
-(`ui/recorder.py`). 4. Meeting details with playback, transcript, summary,
-and action items (`ui/meeting_details.py`). 5. System status footer
-(`ui/system_status.py`).
+**Core screens:** 1. Login/profile selection (`client/src/pages/LoginPage.jsx`). 2. Dashboard with meeting list and search (`DashboardPage.jsx`). 3. Recording (`RecordPage.jsx`). 4. Meeting details with playback, transcript, summary, action items, speakers, attachments, metrics, jobs (`MeetingDetailsPage.jsx`). 5. System status (`SystemStatusPage.jsx`).
 
 **Workflow:** 1. Build one small screen per responsibility. 2. Route every
-server interaction through `client/api_client.py` — never touch the
-database, files, or audio logic from `ui/`. 3. Run uploads, polling, and
+server interaction through `client/src/api/client.js` — never touch the
+database/files/audio logic directly; use FastAPI endpoints. 3. Run uploads, polling, and
 downloads in worker threads; deliver results via Qt signals. 4. Poll job
 status while transcription/analysis runs; offer cancel. 5. Read
 `GET /system/status` (`can_record`) to enable or disable recording for
 read-only clients.
 
-**Rules:** - Never run uploads, downloads, or polling on the UI thread. -
+**Rules:** - Do not block the UI with unhandled errors. -
 Map `ApiClientError`/`ApiConnectionError` to actionable messages. - Require
 explicit user action to start recording; keep the recording state
 unmistakable. - Confirm destructive actions. - Keep cloud-processing

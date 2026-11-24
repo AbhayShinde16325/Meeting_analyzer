@@ -10,7 +10,8 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
+from pathlib import Path
 from sqlalchemy import text
 
 from api import errors
@@ -192,3 +193,28 @@ def delete_profile(
         profiler.delete_profile(str(profile_id))
     except SpeakerProfilingError as exc:
         raise _profiling_error(exc) from None
+
+
+@profiles_router.post("/{profile_id}/enroll", response_model=dict)
+def enroll_profile(
+    _: Annotated[None, Depends(require_host)],
+    profile_id: uuid.UUID,
+    profiler: ProfilerDep,
+    file: UploadFile = File(...),
+) -> dict:
+    """Host-only: enroll a clean voice sample to a speaker profile."""
+    import tempfile
+    suffix = Path(file.filename or "enrollment.wav").suffix.lower() or ".wav"
+    with tempfile.TemporaryDirectory(prefix="tma-enroll-") as td:
+        path = Path(td) / f"enroll{suffix}"
+        size = 0
+        with open(path, "wb") as out:
+            while chunk := file.file.read(1024 * 1024):
+                size += len(chunk)
+                out.write(chunk)
+        if size <= 44:
+            raise errors.bad_request("empty_audio", "Enrollment audio is empty.")
+        try:
+            return profiler.enroll_profile_audio(profile_id=str(profile_id), audio_path=path)
+        except SpeakerProfilingError as exc:
+            raise _profiling_error(exc) from None
