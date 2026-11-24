@@ -18,7 +18,7 @@ def health(conn: ConnDep) -> dict:
     try:
         db_ok = conn.execute(text("SELECT 1")).scalar_one() == 1
         revision = conn.execute(
-            text("SELECT version_num FROM alembic_version")
+            text("SELECT version_num FROM meeting_analyzer.alembic_version")
         ).scalar_one_or_none()
     except Exception:
         db_ok, revision = False, None

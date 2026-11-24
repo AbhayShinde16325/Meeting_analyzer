@@ -18,6 +18,20 @@ from sqlalchemy import text
 
 from ai.transcription import TranscriptionResult
 
+def _wav_bytes(duration_sec: float = 0.2, sample_rate: int = 16000) -> bytes:
+    import math, struct, wave
+    nframes = int(duration_sec * sample_rate)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        for i in range(nframes):
+            s = int(16000 * math.sin(2 * math.pi * 440 * i / sample_rate))
+            wf.writeframes(struct.pack('<h', s))
+    return buf.getvalue()
+
+
 
 @pytest.fixture(scope="module")
 def api(pg_engine):
@@ -28,6 +42,18 @@ def api(pg_engine):
 
     import api.app as app_module
     from fastapi.testclient import TestClient
+    from sqlalchemy import text as _text
+
+    # Minimal Task Manager tables for sync integration tests.
+    with pg_engine.begin() as _conn:
+        _conn.execute(_text("CREATE SCHEMA IF NOT EXISTS public"))
+        _conn.execute(_text("""CREATE TABLE IF NOT EXISTS public.employees (
+            id serial PRIMARY KEY, name varchar NOT NULL, email varchar, is_active boolean NOT NULL DEFAULT true)"""))
+        _conn.execute(_text("""CREATE TABLE IF NOT EXISTS public.tasks (
+            id serial PRIMARY KEY, task_title varchar NOT NULL, task_description varchar, assigned_to varchar,
+            created_by_employee_id integer, assigned_to_employee_id integer, assigned_date date, assigned_time time,
+            deadline_date date, deadline_time time, reminder_date date, reminder_time time,
+            status varchar DEFAULT 'PENDING', progress integer DEFAULT 0)"""))
 
     # Point the app's own engine wiring at the scratch database.
     old_url = os.environ.get("DATABASE_URL")
@@ -107,8 +133,16 @@ def pg_engine_module(pg_engine):
 @pytest.fixture(autouse=True)
 def _clean(pg_engine):
     from pg_harness import truncate_all
+    from sqlalchemy import text as _text
 
     truncate_all(pg_engine)
+    with pg_engine.begin() as conn:
+        for tbl in ("public.tasks", "public.employees"):
+            try:
+                with conn.begin_nested():
+                    conn.execute(_text(f"TRUNCATE TABLE {tbl} CASCADE"))
+            except Exception:
+                pass
 
 
 @pytest.fixture
@@ -170,15 +204,15 @@ class TestMeetingCreation:
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "empty_recording"
 
-    def test_remote_profile_cannot_create(self, api):
+    def test_remote_profile_can_create(self, api):
         user = api.post("/users", json={"display_name": "Remote"}).json()
         response = api.post(
             "/meetings",
             headers={"X-Profile-Id": user["id"]},
-            data={"title": "Nope"},
-            files={"file": ("a.wav", b"RIFFxx", "audio/wav")},
+            data={"title": "Remote meeting"},
+            files={"file": ("a.wav", _wav_bytes(), "audio/wav")},
         )
-        assert response.status_code in (200, 202, 204)
+        assert response.status_code == 201
 
 
 class TestStreaming:
@@ -334,7 +368,11 @@ class TestTranscriptAndAnalysis:
         assert again.status_code == 404
         assert again.json()["error"]["code"] == "job_not_cancellable"
 
-    def test_analysis_flow(self, api, user_headers_and_id):
+    def test_analysis_flow(self, api, user_headers_and_id, monkeypatch):
+        monkeypatch.setenv("TEAMMEETINGAI_ANALYSIS_BACKEND", "groq")
+        monkeypatch.setenv("TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS", "1")
+        monkeypatch.setenv("TEAMMEETINGAI_GROQ_MODEL", "test-model")
+        monkeypatch.setenv("TEAMMEETINGAI_GROQ_API_KEY", "test-key")
         _headers, user_id = user_headers_and_id
         meeting = _ingest_meeting(api, user_id)
         _run_job(api, _transcribe(api, meeting["id"])["id"])
@@ -353,7 +391,7 @@ class TestTranscriptAndAnalysis:
         assert meeting_details["status"] == "completed"
 
     def test_reanalysis_replaces_the_previous_summary(
-        self, api, user_headers_and_id, pg_engine
+        self, api, user_headers_and_id, pg_engine, monkeypatch
     ):
         """Re-analysing must replace the stored summary, not violate its key.
 
@@ -361,6 +399,10 @@ class TestTranscriptAndAnalysis:
         chains one analysis, so a second analysis run used to fail with an
         IntegrityError and leave the job unsuccessful.
         """
+        monkeypatch.setenv("TEAMMEETINGAI_ANALYSIS_BACKEND", "groq")
+        monkeypatch.setenv("TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS", "1")
+        monkeypatch.setenv("TEAMMEETINGAI_GROQ_MODEL", "test-model")
+        monkeypatch.setenv("TEAMMEETINGAI_GROQ_API_KEY", "test-key")
 
         _headers, user_id = user_headers_and_id
         meeting = _ingest_meeting(api, user_id)
@@ -382,7 +424,7 @@ class TestTranscriptAndAnalysis:
         # summary/items really were replaced rather than orphaned.
         with pg_engine.connect() as conn:
             summary_ids = conn.execute(
-                text("SELECT summary_id FROM action_items WHERE meeting_id = :m"),
+                text("SELECT summary_id FROM meeting_analyzer.action_items WHERE meeting_id = :m"),
                 {"m": meeting["id"]},
             ).scalars().all()
         assert summary_ids == [uuid.UUID(summary["id"])]
@@ -505,14 +547,14 @@ class TestDeletion:
         # 3 LOs existed (2 audio + 1 attachment) and all are gone.
         assert after == before - 3
 
-    def test_remote_profile_cannot_delete(self, api, user_headers_and_id):
+    def test_remote_profile_can_delete(self, api, user_headers_and_id):
         _headers, user_id = user_headers_and_id
         meeting = _ingest_meeting(api, user_id)
         remote = api.post("/users", json={"display_name": "R"}).json()
         response = api.delete(
             f"/meetings/{meeting['id']}", headers={"X-Profile-Id": remote["id"]}
         )
-        assert response.status_code == 403
+        assert response.status_code == 204
 
 
 class TestExport:
@@ -552,10 +594,10 @@ class TestSearchAndSystem:
         status = api.get("/system/status").json()
         assert status["meeting_count"] == 1
         assert status["db_size_bytes"] > 0
-        assert status["schema_version"] == "0003_transcript_metrics"
+        assert status["schema_version"] == "0004_meeting_task_sync"
         assert status["can_record"] is True
 
     def test_health(self, api):
         response = api.get("/health").json()
         assert response["status"] == "ok"
-        assert response["schema"] == "0003_transcript_metrics"
+        assert response["schema"] == "0004_meeting_task_sync"

@@ -189,7 +189,7 @@ def sweep_orphan_los(conn: Connection) -> int:
         conn.execute(
             text(
                 "SELECT l.oid FROM pg_largeobject_metadata l "
-                "WHERE NOT EXISTS (SELECT 1 FROM meeting_files f WHERE f.lo_oid = l.oid)"
+                "WHERE NOT EXISTS (SELECT 1 FROM meeting_analyzer.meeting_files f WHERE f.lo_oid = l.oid)"
             )
         )
         .scalars()

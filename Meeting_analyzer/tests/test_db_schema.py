@@ -19,7 +19,7 @@ from db import lo
 def user_id(pg):
     return pg.execute(
         text(
-            "INSERT INTO users (id, display_name) VALUES (gen_random_uuid(), 'Test User') "
+            "INSERT INTO meeting_analyzer.users (id, display_name) VALUES (gen_random_uuid(), 'Test User') "
             "RETURNING id"
         )
     ).scalar_one()
@@ -29,7 +29,7 @@ def user_id(pg):
 def meeting_id(pg, user_id):
     return pg.execute(
         text(
-            "INSERT INTO meetings (id, user_id, title) VALUES (gen_random_uuid(), "
+            "INSERT INTO meeting_analyzer.meetings (id, user_id, title) VALUES (gen_random_uuid(), "
             ":user_id, 'Test meeting') RETURNING id"
         ),
         {"user_id": user_id},
@@ -44,7 +44,7 @@ def audio_file_id(pg, meeting_id):
     oid, sha, size = lo.create_lo_from_bytes(pg, payload)
     return pg.execute(
         text(
-            "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+            "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
             "size_bytes, mime_type, sample_rate, channels) VALUES (gen_random_uuid(), "
             ":meeting_id, 'original_audio_48k', :oid, :sha, :size, 'audio/wav', 48000, 2) "
             "RETURNING id"
@@ -58,7 +58,7 @@ class TestMeetingLifecycle:
         row = (
             pg.execute(
                 text(
-                    "INSERT INTO meetings (user_id, title) VALUES (:u, 'T') "
+                    "INSERT INTO meeting_analyzer.meetings (user_id, title) VALUES (:u, 'T') "
                     "RETURNING status, recorded_at"
                 ),
                 {"u": user_id},
@@ -72,7 +72,7 @@ class TestMeetingLifecycle:
     def test_status_check_rejects_unknown(self, pg, user_id):
         with pytest.raises(Exception):
             pg.execute(
-                text("INSERT INTO meetings (user_id, title, status) VALUES (:u, 'T', 'nope')"),
+                text("INSERT INTO meeting_analyzer.meetings (user_id, title, status) VALUES (:u, 'T', 'nope')"),
                 {"u": user_id},
             )
             pg.commit()
@@ -83,7 +83,7 @@ class TestFileConstraints:
         first_oid, first_sha, first_size = lo.create_lo_from_bytes(pg, b"first track")
         pg.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes) VALUES (gen_random_uuid(), :m, 'original_audio_48k', "
                 ":oid, :sha, :size)"
             ),
@@ -94,7 +94,7 @@ class TestFileConstraints:
         with pytest.raises(Exception):
             pg.execute(
                 text(
-                    "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                    "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                     "size_bytes) VALUES (gen_random_uuid(), :m, 'original_audio_48k', "
                     ":oid, :sha, :size)"
                 ),
@@ -107,7 +107,7 @@ class TestFileConstraints:
         with pytest.raises(Exception):
             pg.execute(
                 text(
-                    "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                    "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                     "size_bytes) VALUES (gen_random_uuid(), :m, 'blob', :oid, :sha, :size)"
                 ),
                 {"m": meeting_id, "oid": oid, "sha": sha, "size": size},
@@ -118,7 +118,7 @@ class TestFileConstraints:
         oid, sha, size = lo.create_lo_from_bytes(pg, b"shared bytes")
         pg.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, original_filename) VALUES (gen_random_uuid(), "
                 ":m, 'attachment', :oid, :sha, :size, 'text/plain', 'a.txt')"
             ),
@@ -128,14 +128,14 @@ class TestFileConstraints:
             # A second meeting cannot claim the same LO.
             other = pg.execute(
                 text(
-                    "INSERT INTO meetings (user_id, title) SELECT user_id, 'other' "
-                    "FROM meetings WHERE id = :m RETURNING id"
+                    "INSERT INTO meeting_analyzer.meetings (user_id, title) SELECT user_id, 'other' "
+                    "FROM meeting_analyzer.meetings WHERE id = :m RETURNING id"
                 ),
                 {"m": meeting_id},
             ).scalar_one()
             pg.execute(
                 text(
-                    "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                    "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                     "size_bytes, mime_type, original_filename) VALUES (gen_random_uuid(), "
                     ":m, 'attachment', :oid, :sha, :size, 'text/plain', 'a.txt')"
                 ),
@@ -149,7 +149,7 @@ class TestAttachmentConstraints:
         oid, sha, _ = lo.create_lo_from_bytes(pg, b"a" * min(size, 1024))
         pg.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, original_filename) VALUES (gen_random_uuid(), "
                 ":m, 'attachment', :oid, :sha, :size, :mime, :name)"
             ),
@@ -192,7 +192,7 @@ class TestAttachmentConstraints:
         oid, sha, size = lo.create_lo_from_bytes(pg, b"audio")
         pg.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, sample_rate) VALUES (gen_random_uuid(), :m, "
                 "'derived_audio_16k', :oid, :sha, :size, 'audio/wav', 16000)"
             ),
@@ -204,19 +204,19 @@ class TestAttachmentConstraints:
 class TestDeletion:
     def test_hard_delete_removes_rows_and_large_objects(self, pg, meeting_id, audio_file_id):
         oid = pg.execute(
-            text("SELECT lo_oid FROM meeting_files WHERE id = :id"), {"id": audio_file_id}
+            text("SELECT lo_oid FROM meeting_analyzer.meeting_files WHERE id = :id"), {"id": audio_file_id}
         ).scalar_one()
         # Add a transcript so cascade covers multiple tables.
         pg.execute(
             text(
-                "INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, "
+                "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, is_primary, "
                 "text) VALUES (gen_random_uuid(), :m, 'whisper', 'small', true, 'text')"
             ),
             {"m": meeting_id},
         )
         pg.execute(
             text(
-                "INSERT INTO summaries (id, meeting_id, payload, model) VALUES "
+                "INSERT INTO meeting_analyzer.summaries (id, meeting_id, payload, model) VALUES "
                 "(gen_random_uuid(), :m, '{\"overview\": \"x\"}'::jsonb, 'm')"
             ),
             {"m": meeting_id},
@@ -225,12 +225,12 @@ class TestDeletion:
         before = int(
             pg.execute(text("SELECT COUNT(*) FROM pg_largeobject_metadata")).scalar_one()
         )
-        pg.execute(text("DELETE FROM meetings WHERE id = :m"), {"m": meeting_id})
+        pg.execute(text("DELETE FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id})
         pg.commit()
 
-        assert pg.execute(text("SELECT COUNT(*) FROM meeting_files")).scalar_one() == 0
-        assert pg.execute(text("SELECT COUNT(*) FROM transcripts")).scalar_one() == 0
-        assert pg.execute(text("SELECT COUNT(*) FROM summaries")).scalar_one() == 0
+        assert pg.execute(text("SELECT COUNT(*) FROM meeting_analyzer.meeting_files")).scalar_one() == 0
+        assert pg.execute(text("SELECT COUNT(*) FROM meeting_analyzer.transcripts")).scalar_one() == 0
+        assert pg.execute(text("SELECT COUNT(*) FROM meeting_analyzer.summaries")).scalar_one() == 0
         after = int(
             pg.execute(text("SELECT COUNT(*) FROM pg_largeobject_metadata")).scalar_one()
         )
@@ -239,9 +239,9 @@ class TestDeletion:
 
     def test_deleted_lo_bytes_are_unreadable(self, pg, meeting_id, audio_file_id):
         oid = pg.execute(
-            text("SELECT lo_oid FROM meeting_files WHERE id = :id"), {"id": audio_file_id}
+            text("SELECT lo_oid FROM meeting_analyzer.meeting_files WHERE id = :id"), {"id": audio_file_id}
         ).scalar_one()
-        pg.execute(text("DELETE FROM meetings WHERE id = :m"), {"m": meeting_id})
+        pg.execute(text("DELETE FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id})
         pg.commit()
         # lo_get on an unlinked OID returns nothing / errors; assert gone.
         count = pg.execute(
@@ -256,7 +256,7 @@ class TestPrimaryTranscript:
         def add(primary: bool) -> None:
             pg.execute(
                 text(
-                    "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                    "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, "
                     "is_primary, text) VALUES (gen_random_uuid(), :m, 'sarvam', "
                     "'saaras:v4', :p, 'text')"
                 ),
@@ -272,7 +272,7 @@ class TestPrimaryTranscript:
         for _ in range(3):
             pg.execute(
                 text(
-                    "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                    "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, "
                     "is_primary, text) VALUES (gen_random_uuid(), :m, 'whisper', "
                     "'small', false, 'text')"
                 ),
@@ -283,7 +283,7 @@ class TestPrimaryTranscript:
     def test_primary_flag_change_works(self, pg, meeting_id):
         first = pg.execute(
             text(
-                "INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, "
+                "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, is_primary, "
                 "text) VALUES (gen_random_uuid(), :m, 'sarvam', 'saaras:v4', true, 'a') "
                 "RETURNING id"
             ),
@@ -291,20 +291,20 @@ class TestPrimaryTranscript:
         ).scalar_one()
         second = pg.execute(
             text(
-                "INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, "
+                "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, is_primary, "
                 "text) VALUES (gen_random_uuid(), :m, 'whisper', 'small', false, 'b') "
                 "RETURNING id"
             ),
             {"m": meeting_id},
         ).scalar_one()
         # Demote and promote in one statement set (as the API will).
-        pg.execute(text("UPDATE transcripts SET is_primary = false WHERE id = :id"),
+        pg.execute(text("UPDATE meeting_analyzer.transcripts SET is_primary = false WHERE id = :id"),
                    {"id": first})
-        pg.execute(text("UPDATE transcripts SET is_primary = true WHERE id = :id"),
+        pg.execute(text("UPDATE meeting_analyzer.transcripts SET is_primary = true WHERE id = :id"),
                    {"id": second})
         pg.commit()
         primary = pg.execute(
-            text("SELECT id FROM transcripts WHERE is_primary AND meeting_id = :m"),
+            text("SELECT id FROM meeting_analyzer.transcripts WHERE is_primary AND meeting_id = :m"),
             {"m": meeting_id},
         ).scalar_one()
         assert primary == second

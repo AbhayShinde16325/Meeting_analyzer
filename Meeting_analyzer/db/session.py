@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from db.base import Base
+from db.base import MEETING_ANALYZER_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +37,19 @@ def database_url_from_env() -> str:
 def build_engine(url: str | None = None) -> Engine:
     """Create a connection engine for the server process.
 
-    ``pool_pre_ping`` reconnects transparently after PostgreSQL restarts
-    (which happens with Windows updates) instead of failing requests.
+    ``pool_pre_ping`` reconnects transparently after PostgreSQL restarts.
+    ``search_path`` is pinned to ``meeting_analyzer, public`` so Meeting
+    Analyzer SQL targets its own schema while preserving access to shared
+    extensions/catalogs. This engine must only be used by Meeting Analyzer.
     """
 
     resolved = url or database_url_from_env()
-    return create_engine(resolved, pool_pre_ping=True, future=True)
+    return create_engine(
+        resolved,
+        pool_pre_ping=True,
+        future=True,
+        connect_args={"options": f"-csearch_path={MEETING_ANALYZER_SCHEMA},public"},
+    )
 
 
 def _known_revisions() -> set[str]:
@@ -57,11 +64,48 @@ def _known_revisions() -> set[str]:
     return {rev.revision for rev in script.walk_revisions()}
 
 
-def current_db_revision(conn) -> str | None:
-    """Return the revision recorded in the database, if the table exists."""
+def _alembic_version_table(conn) -> str | None:
+    """Locate Meeting Analyzer's alembic version table.
 
+    Prefer ``meeting_analyzer.alembic_version``. Fallback to
+    ``public.alembic_version`` only when its revision is a known Meeting
+    Analyzer revision (legacy pre-schema install) to avoid touching Task
+    Manager's independent Alembic history in the same database.
+    """
+
+    for schema in (MEETING_ANALYZER_SCHEMA, "public"):
+        try:
+            row = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = :schema AND table_name = 'alembic_version'"
+                ),
+                {"schema": schema},
+            ).first()
+        except SQLAlchemyError:
+            continue
+        if row is None:
+            continue
+        table = f"{schema}.alembic_version"
+        if schema == MEETING_ANALYZER_SCHEMA:
+            return table
+        try:
+            rev = conn.execute(text(f"SELECT version_num FROM {table}")).scalar()
+        except SQLAlchemyError:
+            continue
+        if rev and str(rev) in _known_revisions():
+            return table
+    return None
+
+
+def current_db_revision(conn) -> str | None:
+    """Return the Meeting Analyzer revision recorded in the database."""
+
+    table = _alembic_version_table(conn)
+    if table is None:
+        return None
     try:
-        row = conn.execute(text("SELECT version_num FROM alembic_version")).first()
+        row = conn.execute(text(f"SELECT version_num FROM {table}")).first()
     except SQLAlchemyError:
         return None
     if row is None:
@@ -82,8 +126,9 @@ def ensure_schema_current(engine: Engine) -> str:
         db_revision = current_db_revision(conn)
     if db_revision is None:
         raise RuntimeError(
-            "The database schema is missing. Run 'alembic upgrade head' with "
-            "TEAMMEETINGAI_DATABASE_URL pointing at the server database."
+            "The Meeting Analyzer database schema is missing. Run "
+            "'alembic -c Meeting_analyzer/alembic.ini upgrade head' with "
+            "DATABASE_URL/TEAMMEETINGAI_DATABASE_URL pointing at the target database."
         )
     if db_revision not in known:
         raise SchemaTooNewError(

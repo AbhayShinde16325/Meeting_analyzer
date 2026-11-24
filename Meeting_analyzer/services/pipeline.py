@@ -39,6 +39,7 @@ from ai.transcription import (
 )
 from db import lo
 from services.speaker_profiles import SpeakerProfileService, SpeakerProfilingError
+from services.task_sync import TaskSyncError, sync_action_items_to_tasks
 from services.transcript_metrics import compute_transcript_metrics
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ class TranscriptionPipeline:
             job = (
                 conn.execute(
                     text(
-                        "SELECT meeting_id, job_type FROM processing_jobs WHERE id = :id"
+                        "SELECT meeting_id, job_type FROM meeting_analyzer.processing_jobs WHERE id = :id"
                     ),
                     {"id": job_id},
                 )
@@ -118,7 +119,7 @@ class TranscriptionPipeline:
             file_row = (
                 conn.execute(
                     text(
-                        "SELECT lo_oid FROM meeting_files WHERE meeting_id = :m "
+                        "SELECT lo_oid FROM meeting_analyzer.meeting_files WHERE meeting_id = :m "
                         "AND kind = 'derived_audio_16k'"
                     ),
                     {"m": meeting_id},
@@ -127,7 +128,7 @@ class TranscriptionPipeline:
                 .one_or_none()
             )
             duration = conn.execute(
-                text("SELECT duration_ms FROM meetings WHERE id = :m"),
+                text("SELECT duration_ms FROM meeting_analyzer.meetings WHERE id = :m"),
                 {"m": meeting_id},
             ).scalar_one()
         if file_row is None:
@@ -165,7 +166,7 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             # Exactly one primary transcript: demote any previous one first.
             conn.execute(
-                text("UPDATE transcripts SET is_primary = false WHERE meeting_id = :m"),
+                text("UPDATE meeting_analyzer.transcripts SET is_primary = false WHERE meeting_id = :m"),
                 {"m": meeting_id},
             )
             # The previous analysis was derived from the transcript that is
@@ -173,16 +174,16 @@ class TranscriptionPipeline:
             # disagree with the new primary transcript; analysis re-runs and
             # recreates both.
             conn.execute(
-                text("DELETE FROM action_items WHERE meeting_id = :m"),
+                text("DELETE FROM meeting_analyzer.action_items WHERE meeting_id = :m"),
                 {"m": meeting_id},
             )
             conn.execute(
-                text("DELETE FROM summaries WHERE meeting_id = :m"),
+                text("DELETE FROM meeting_analyzer.summaries WHERE meeting_id = :m"),
                 {"m": meeting_id},
             )
             transcript_id = conn.execute(
                 text(
-                    "INSERT INTO transcripts (id, meeting_id, provider, model, mode, "
+                    "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, mode, "
                     "language, is_primary, fallback_from, fallback_reason, text, "
                     "segments) VALUES (gen_random_uuid(), :m, :provider, :model, "
                     ":mode, :language, true, :fallback_from, :fallback_reason, :text, "
@@ -218,7 +219,7 @@ class TranscriptionPipeline:
                 )
                 conn.execute(
                     text(
-                        "INSERT INTO transcript_metrics (id, meeting_id, "
+                        "INSERT INTO meeting_analyzer.transcript_metrics (id, meeting_id, "
                         "transcript_id, metrics) VALUES (gen_random_uuid(), :m, "
                         ":t, CAST(:metrics AS jsonb)) "
                         "ON CONFLICT (transcript_id) DO UPDATE SET "
@@ -239,14 +240,14 @@ class TranscriptionPipeline:
                 )
             conn.execute(
                 text(
-                    "UPDATE meetings SET status = 'transcribed', language = "
+                    "UPDATE meeting_analyzer.meetings SET status = 'transcribed', language = "
                     "COALESCE(:language, language) WHERE id = :m"
                 ),
                 {"m": meeting_id, "language": result.language},
             )
             conn.execute(
                 text(
-                    "UPDATE processing_jobs SET status = 'succeeded', progress = 1.0, "
+                    "UPDATE meeting_analyzer.processing_jobs SET status = 'succeeded', progress = 1.0, "
                     "message = 'Transcription complete', finished_at = now(), "
                     "fallback_from = :fallback_from, fallback_reason = :fallback_reason "
                     "WHERE id = :id"
@@ -285,7 +286,7 @@ class TranscriptionPipeline:
         value = conn.execute(
             text(
                 "SELECT EXTRACT(EPOCH FROM (now() - started_at)) "
-                "FROM processing_jobs WHERE id = :id AND started_at IS NOT NULL"
+                "FROM meeting_analyzer.processing_jobs WHERE id = :id AND started_at IS NOT NULL"
             ),
             {"id": job_id},
         ).scalar()
@@ -295,7 +296,7 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             return conn.execute(
                 text(
-                    "INSERT INTO processing_jobs (id, meeting_id, job_type, status, "
+                    "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, "
                     "message) VALUES (gen_random_uuid(), :m, 'analysis', 'queued', "
                     "'Queued for analysis') RETURNING id"
                 ),
@@ -306,7 +307,7 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             return conn.execute(
                 text(
-                    "INSERT INTO processing_jobs (id, meeting_id, job_type, status, "
+                    "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, "
                     "message) VALUES (gen_random_uuid(), :m, 'profiling', 'queued', "
                     "'Queued for voice profiling') RETURNING id"
                 ),
@@ -325,7 +326,7 @@ class TranscriptionPipeline:
             primary = (
                 conn.execute(
                     text(
-                        "SELECT id, text, language FROM transcripts WHERE meeting_id = :m "
+                        "SELECT id, text, language FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
                         "AND is_primary = true"
                     ),
                     {"m": meeting_id},
@@ -345,23 +346,12 @@ class TranscriptionPipeline:
             str(primary["text"]), progress_cb=progress
         )
         action_items = analysis.get("action_items") or []
-
         with self._engine.begin() as conn:
-            # Re-analysis replaces the previous result: the schema keeps one
-            # summary per meeting, and derived notes must always describe the
-            # current primary transcript.  Item rows are removed explicitly
-            # (their FK is ON DELETE SET NULL, which would orphan them).
-            conn.execute(
-                text("DELETE FROM action_items WHERE meeting_id = :m"),
-                {"m": meeting_id},
-            )
-            conn.execute(
-                text("DELETE FROM summaries WHERE meeting_id = :m"),
-                {"m": meeting_id},
-            )
+            conn.execute(text("UPDATE meeting_analyzer.meetings SET status = 'analyzing' WHERE id = :m"), {"m": meeting_id})
+            conn.execute(text("DELETE FROM meeting_analyzer.summaries WHERE meeting_id = :m"), {"m": meeting_id})
             summary_id = conn.execute(
                 text(
-                    "INSERT INTO summaries (id, meeting_id, transcript_id, overview, "
+                    "INSERT INTO meeting_analyzer.summaries (id, meeting_id, transcript_id, overview, "
                     "payload, model) VALUES (gen_random_uuid(), :m, :transcript_id, "
                     ":overview, CAST(:payload AS jsonb), :model) RETURNING id"
                 ),
@@ -370,40 +360,31 @@ class TranscriptionPipeline:
                     "transcript_id": primary["id"],
                     "overview": analysis.get("overview"),
                     "payload": _json(analysis),
-                    "model": self._summarizer.provider_model_name or "unknown",
+                    "model": getattr(self._summarizer, "model_name", "unknown"),
                 },
             ).scalar_one()
-            for position, item in enumerate(action_items):
-                conn.execute(
-                    text(
-                        "INSERT INTO action_items (id, meeting_id, summary_id, task, "
-                        "owner, deadline, evidence, position) VALUES "
-                        "(gen_random_uuid(), :m, :summary_id, :task, :owner, "
-                        ":deadline, :evidence, :position)"
-                    ),
-                    {
-                        "m": meeting_id,
-                        "summary_id": summary_id,
-                        "task": item.get("task") or "",
-                        "owner": item.get("owner"),
-                        "deadline": item.get("deadline"),
-                        "evidence": item.get("evidence"),
-                        "position": position,
-                    },
+        try:
+            with self._engine.begin() as conn:
+                sync_result = sync_action_items_to_tasks(
+                    conn, meeting_id=meeting_id, transcript_id=str(primary["id"]), action_items=action_items
                 )
-            conn.execute(
-                text(
-                    "UPDATE meetings SET status = 'completed' WHERE id = :m"
-                ),
-                {"m": meeting_id},
-            )
-            conn.execute(
-                text(
-                    "UPDATE processing_jobs SET status = 'succeeded', progress = 1.0, "
-                    "message = 'Analysis complete', finished_at = now() WHERE id = :id"
-                ),
-                {"id": job_id},
-            )
+                conn.execute(text("DELETE FROM meeting_analyzer.action_items WHERE meeting_id = :m"), {"m": meeting_id})
+                for position, item in enumerate(action_items):
+                    conn.execute(text(
+                        "INSERT INTO meeting_analyzer.action_items (id, meeting_id, summary_id, task, owner, deadline, evidence, status, position) "
+                        "VALUES (gen_random_uuid(), :m, :s, :task, :owner, :deadline, :evidence, 'open', :position)"
+                    ), {
+                        "m": meeting_id, "s": summary_id, "task": item["task"], "owner": item.get("owner"),
+                        "deadline": item.get("deadline"), "evidence": item.get("evidence"), "position": position,
+                    })
+                conn.execute(text("UPDATE meeting_analyzer.meetings SET status = 'completed' WHERE id = :m"), {"m": meeting_id})
+                conn.execute(text(
+                    "UPDATE meeting_analyzer.processing_jobs SET status = 'succeeded', progress = 1.0, message = :msg, finished_at = now() WHERE id = :id"
+                ), {"id": job_id, "msg": f"Analysis complete; synced {sync_result.get('created',0)} tasks"})
+        except TaskSyncError as exc:
+            logger.exception("Task sync failed after analysis for meeting %s", meeting_id)
+            self._fail_job(job_id, "failed", f"Analysis saved, but task sync failed: {exc}")
+            return
         logger.info("Analysis job %s succeeded for meeting %s.", job_id, meeting_id)
 
     # -- voice profiling ------------------------------------------------------
@@ -419,7 +400,7 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             primary = conn.execute(
                 text(
-                    "SELECT id, segments FROM transcripts WHERE meeting_id = :m "
+                    "SELECT id, segments FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
                     "AND is_primary = true"
                 ),
                 {"m": meeting_id},
@@ -438,7 +419,7 @@ class TranscriptionPipeline:
             ]
             file_row = conn.execute(
                 text(
-                    "SELECT lo_oid FROM meeting_files WHERE meeting_id = :m "
+                    "SELECT lo_oid FROM meeting_analyzer.meeting_files WHERE meeting_id = :m "
                     "AND kind = 'derived_audio_16k'"
                 ),
                 {"m": meeting_id},
@@ -496,7 +477,7 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             conn.execute(
                 text(
-                    "UPDATE processing_jobs SET status = 'succeeded', progress = 1.0, "
+                    "UPDATE meeting_analyzer.processing_jobs SET status = 'succeeded', progress = 1.0, "
                     "message = :message, finished_at = now() WHERE id = :id"
                 ),
                 {"id": job_id, "message": message},
@@ -508,7 +489,7 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             conn.execute(
                 text(
-                    "UPDATE processing_jobs SET status = :status, message = :message, "
+                    "UPDATE meeting_analyzer.processing_jobs SET status = :status, message = :message, "
                     "started_at = COALESCE(started_at, now()), updated_at = now() "
                     "WHERE id = :id"
                 ),
@@ -526,7 +507,7 @@ class TranscriptionPipeline:
             with self._engine.begin() as conn:
                 conn.execute(
                     text(
-                        "UPDATE processing_jobs SET progress = :p, message = :m, "
+                        "UPDATE meeting_analyzer.processing_jobs SET progress = :p, message = :m, "
                         "updated_at = now() WHERE id = :id"
                     ),
                     {"id": job_id, "p": float(percent), "m": message},
@@ -537,7 +518,7 @@ class TranscriptionPipeline:
     def _is_job_cancelled(self, job_id: str) -> bool:
         with self._engine.connect() as conn:
             status = conn.execute(
-                text("SELECT status FROM processing_jobs WHERE id = :id"),
+                text("SELECT status FROM meeting_analyzer.processing_jobs WHERE id = :id"),
                 {"id": job_id},
             ).scalar_one_or_none()
         return status == "cancelled"
@@ -546,19 +527,19 @@ class TranscriptionPipeline:
         with self._engine.begin() as conn:
             conn.execute(
                 text(
-                    "UPDATE processing_jobs SET status = :status, error = :error, "
+                    "UPDATE meeting_analyzer.processing_jobs SET status = :status, error = :error, "
                     "message = :error, finished_at = now() WHERE id = :id"
                 ),
                 {"id": job_id, "status": status, "error": error},
             )
             meeting_id = conn.execute(
-                text("SELECT meeting_id FROM processing_jobs WHERE id = :id"),
+                text("SELECT meeting_id FROM meeting_analyzer.processing_jobs WHERE id = :id"),
                 {"id": job_id},
             ).scalar_one_or_none()
             if status == "failed" and meeting_id:
                 conn.execute(
                     text(
-                        "UPDATE meetings SET status = 'failed' WHERE id = :m AND "
+                        "UPDATE meeting_analyzer.meetings SET status = 'failed' WHERE id = :m AND "
                         "status NOT IN ('completed')"
                     ),
                     {"m": meeting_id},

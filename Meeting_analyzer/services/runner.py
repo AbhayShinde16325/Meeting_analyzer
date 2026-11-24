@@ -19,10 +19,10 @@ from services.pipeline import TranscriptionPipeline
 logger = logging.getLogger(__name__)
 
 _CLAIM_SQL = text(
-    "UPDATE processing_jobs SET status = 'running', started_at = now(), "
+    "UPDATE meeting_analyzer.processing_jobs SET status = 'running', started_at = now(), "
     "updated_at = now() "
     "WHERE id = ("
-    "  SELECT id FROM processing_jobs"
+    "  SELECT id FROM meeting_analyzer.processing_jobs"
     "  WHERE status = 'queued'"
     "  ORDER BY created_at"
     "  FOR UPDATE SKIP LOCKED LIMIT 1"

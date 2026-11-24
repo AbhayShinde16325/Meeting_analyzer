@@ -111,7 +111,7 @@ class Meeting(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.users.id", ondelete="CASCADE"),
         nullable=False,
     )
     title: Mapped[str] = mapped_column(Text, nullable=False)
@@ -174,7 +174,7 @@ class MeetingFile(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -208,7 +208,7 @@ class Transcript(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -238,12 +238,12 @@ class Summary(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     # The primary (Roman transliteration) transcript the summary was built from.
     transcript_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("transcripts.id", ondelete="SET NULL"), nullable=True
+        Uuid(as_uuid=True), ForeignKey("meeting_analyzer.transcripts.id", ondelete="SET NULL"), nullable=True
     )
     overview: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
@@ -265,11 +265,11 @@ class ActionItem(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     summary_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("summaries.id", ondelete="SET NULL"), nullable=True
+        Uuid(as_uuid=True), ForeignKey("meeting_analyzer.summaries.id", ondelete="SET NULL"), nullable=True
     )
     task: Mapped[str] = mapped_column(Text, nullable=False)
     owner: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -302,7 +302,7 @@ class ProcessingJob(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -364,17 +364,17 @@ class SpeakerEmbedding(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     transcript_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("transcripts.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.transcripts.id", ondelete="CASCADE"),
         nullable=False,
     )
     profile_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("speaker_profiles.id", ondelete="SET NULL"),
+        ForeignKey("meeting_analyzer.speaker_profiles.id", ondelete="SET NULL"),
         nullable=True,
     )
     # The diarization label inside the transcript, e.g. "Speaker 0".
@@ -414,17 +414,17 @@ class SpeakerAssignment(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     transcript_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("transcripts.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.transcripts.id", ondelete="CASCADE"),
         nullable=False,
     )
     profile_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("speaker_profiles.id", ondelete="SET NULL"),
+        ForeignKey("meeting_analyzer.speaker_profiles.id", ondelete="SET NULL"),
         nullable=True,
     )
     local_label: Mapped[str] = mapped_column(Text, nullable=False)
@@ -461,12 +461,12 @@ class TranscriptMetrics(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     meeting_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("meetings.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.meetings.id", ondelete="CASCADE"),
         nullable=False,
     )
     transcript_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("transcripts.id", ondelete="CASCADE"),
+        ForeignKey("meeting_analyzer.transcripts.id", ondelete="CASCADE"),
         nullable=False,
     )
     metrics: Mapped[dict] = mapped_column(JSONB, nullable=False)

@@ -47,16 +47,16 @@ def list_meetings(
     sql = """
         SELECT m.id, m.user_id, m.title, m.status, m.recorded_at, m.duration_ms,
                m.language, m.notes
-        FROM meetings m
+        FROM meeting_analyzer.meetings m
         WHERE (CAST(:user_id AS uuid) IS NULL OR m.user_id = CAST(:user_id AS uuid))
           AND (CAST(:status AS text) IS NULL OR m.status = CAST(:status AS text))
           AND (
             CAST(:query AS text) IS NULL
             OR m.title ILIKE '%' || :query || '%'
-            OR EXISTS (SELECT 1 FROM transcripts t
+            OR EXISTS (SELECT 1 FROM meeting_analyzer.transcripts t
                        WHERE t.meeting_id = m.id AND t.is_primary
                          AND t.text ILIKE '%' || :query || '%')
-            OR EXISTS (SELECT 1 FROM summaries s
+            OR EXISTS (SELECT 1 FROM meeting_analyzer.summaries s
                        WHERE s.meeting_id = m.id
                          AND s.overview ILIKE '%' || :query || '%')
           )
@@ -100,7 +100,7 @@ def create_meeting(
             "user_required", "Select or create a profile before recording."
         )
     if conn.execute(
-        text("SELECT 1 FROM users WHERE id = :id"), {"id": effective_user}
+        text("SELECT 1 FROM meeting_analyzer.users WHERE id = :id"), {"id": effective_user}
     ).scalar_one_or_none() is None:
         raise errors.not_found("profile_not_found", "Unknown profile.")
 
@@ -140,7 +140,7 @@ def create_meeting(
             except IngestError as exc:
                 raise errors.bad_request("ingest_failed", str(exc)) from exc
             if notes is not None:
-                conn.execute(text("UPDATE meetings SET notes = :n WHERE id = :m"), {"n": notes, "m": uuid.UUID(meeting_id)})
+                conn.execute(text("UPDATE meeting_analyzer.meetings SET notes = :n WHERE id = :m"), {"n": notes, "m": uuid.UUID(meeting_id)})
         finally:
             try:
                 Path(target.name).unlink(missing_ok=True)
@@ -151,7 +151,7 @@ def create_meeting(
         conn.execute(
             text(
                 "SELECT id, user_id, title, status, recorded_at, duration_ms, "
-                "language, notes FROM meetings WHERE id = :id"
+                "language, notes FROM meeting_analyzer.meetings WHERE id = :id"
             ),
             {"id": meeting_id},
         )
@@ -167,7 +167,7 @@ def get_meeting(meeting_id: uuid.UUID, conn: ConnDep) -> dict:
         conn.execute(
             text(
                 "SELECT id, user_id, title, status, recorded_at, duration_ms, "
-                "language, notes FROM meetings WHERE id = :id"
+                "language, notes FROM meeting_analyzer.meetings WHERE id = :id"
             ),
             {"id": meeting_id},
         )
@@ -197,7 +197,7 @@ def create_multi_source_meeting(
     effective_user = user_id or profile.get("id")
     if effective_user is None:
         raise errors.bad_request("user_required", "Select or create a profile before recording.")
-    if conn.execute(text("SELECT 1 FROM users WHERE id = :id"), {"id": effective_user}).scalar_one_or_none() is None:
+    if conn.execute(text("SELECT 1 FROM meeting_analyzer.users WHERE id = :id"), {"id": effective_user}).scalar_one_or_none() is None:
         raise errors.not_found("profile_not_found", "Unknown profile.")
 
     uploads = [("microphone", microphone), ("system", system), ("browser", browser), ("mixed", mixed)]
@@ -243,7 +243,7 @@ def create_multi_source_meeting(
                 except OSError:
                     pass
     row = conn.execute(text(
-        "SELECT id, user_id, title, status, recorded_at, duration_ms, language, notes FROM meetings WHERE id = :id"
+        "SELECT id, user_id, title, status, recorded_at, duration_ms, language, notes FROM meeting_analyzer.meetings WHERE id = :id"
     ), {"id": meeting_id}).mappings().one()
     return dict(row)
 
@@ -257,7 +257,7 @@ def delete_meeting(
     """Permanent deletion (no soft delete, no retention period)."""
 
     result = conn.execute(
-        text("DELETE FROM meetings WHERE id = :id"), {"id": meeting_id}
+        text("DELETE FROM meeting_analyzer.meetings WHERE id = :id"), {"id": meeting_id}
     )
     if result.rowcount == 0:
         raise errors.not_found("meeting_not_found", "Meeting not found.")

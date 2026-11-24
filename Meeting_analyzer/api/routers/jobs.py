@@ -22,7 +22,7 @@ def list_jobs(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
             text(
                 "SELECT id, meeting_id, job_type, status, progress, message, error, "
                 "provider, model, fallback_from, fallback_reason, created_at, "
-                "finished_at FROM processing_jobs WHERE meeting_id = :m "
+                "finished_at FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m "
                 "ORDER BY created_at DESC LIMIT 20"
             ),
             {"m": meeting_id},
@@ -48,7 +48,7 @@ def cancel_job(
     row = (
         conn.execute(
             text(
-                "UPDATE processing_jobs SET status = 'cancelled', "
+                "UPDATE meeting_analyzer.processing_jobs SET status = 'cancelled', "
                 "error = :error, message = 'Cancelling...', finished_at = now() "
                 "WHERE id = :id AND meeting_id = :m AND status IN ('queued', 'running') "
                 "RETURNING id, meeting_id, job_type, status, progress, message, error, "

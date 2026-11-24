@@ -12,17 +12,19 @@ for path in (str(PROJECT_ROOT), str(TESTS_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-# Load TEST_DATABASE_URL from the project .env once per pytest session.
+# Load TEST_DATABASE_URL only. Never fall back to DATABASE_URL: tests create/drop
+# scratch databases and must not run against shared/dev/prod targets.
 if not os.environ.get("TEST_DATABASE_URL"):
-    _env_file = PROJECT_ROOT / ".env"
-    if _env_file.is_file():
+    for _env_file in (PROJECT_ROOT / ".env", PROJECT_ROOT.parent / ".env"):
+        if not _env_file.is_file():
+            continue
         for _line in _env_file.read_text(encoding="utf-8").splitlines():
-            if _line.startswith("DATABASE_URL=") or _line.startswith("TEST_DATABASE_URL="):
-                key, _, value = _line.partition("=")
-                if key.strip() == "TEST_DATABASE_URL" or not os.environ.get("TEST_DATABASE_URL"):
-                    os.environ["TEST_DATABASE_URL"] = value.strip().strip('"').strip("'")
-                if key.strip() == "TEST_DATABASE_URL":
-                    break
+            if _line.startswith("TEST_DATABASE_URL="):
+                _, _, value = _line.partition("=")
+                os.environ["TEST_DATABASE_URL"] = value.strip().strip('"').strip("'")
+                break
+        if os.environ.get("TEST_DATABASE_URL"):
+            break
 
 import pytest  # noqa: E402
 
@@ -62,6 +64,8 @@ def pg_engine():
     from sqlalchemy import create_engine
 
     url = create_scratch_database()
+    os.environ["DATABASE_URL"] = url
+    os.environ["TEAMMEETINGAI_DATABASE_URL"] = url
     migrate_to_head(url)
     engine = create_engine(url, future=True)
     try:
@@ -75,10 +79,44 @@ def pg_engine():
 def pg(pg_engine):
     """A clean database connection: all tables truncated before each test."""
     from pg_harness import truncate_all
+    from sqlalchemy import text
 
     truncate_all(pg_engine)
     with pg_engine.connect() as conn:
+        # Minimal Task Manager tables for integration tests only; isolated scratch DB.
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS public"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.employees (
+                id serial PRIMARY KEY,
+                name varchar NOT NULL,
+                email varchar,
+                is_active boolean NOT NULL DEFAULT true
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS public.tasks (
+                id serial PRIMARY KEY,
+                task_title varchar NOT NULL,
+                task_description varchar,
+                assigned_to varchar,
+                created_by_employee_id integer,
+                assigned_to_employee_id integer,
+                assigned_date date,
+                assigned_time time,
+                deadline_date date,
+                deadline_time time,
+                reminder_date date,
+                reminder_time time,
+                status varchar DEFAULT 'PENDING',
+                progress integer DEFAULT 0
+            )
+        """))
+        conn.commit()
         yield conn
+    # teardown outside yielded transaction
+    with pg_engine.begin() as c2:
+        c2.execute(text("DROP TABLE IF EXISTS public.tasks CASCADE"))
+        c2.execute(text("DROP TABLE IF EXISTS public.employees CASCADE"))
 
 
 @pytest.fixture

@@ -1,5 +1,13 @@
 # TeamMeetingAI — Agent Instructions
 
+## Shared Supabase Schema Isolation
+
+- Uses same `DATABASE_URL` as Task Manager.
+- Task Manager tables stay in `public` (untouched).
+- Meeting Analyzer tables live in `meeting_analyzer` schema.
+- Meeting Analyzer Alembic version table: `meeting_analyzer.alembic_version`.
+- PostgreSQL Large Objects and `meeting_files` LO unlink trigger are preserved.
+
 ## 1. Project Overview
 
 TeamMeetingAI is a **client-server meeting recorder and analyzer** for

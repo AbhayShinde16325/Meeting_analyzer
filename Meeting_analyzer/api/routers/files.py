@@ -45,7 +45,7 @@ def _load_file(conn, file_id) -> dict:
             text(
                 "SELECT id, meeting_id, kind, lo_oid, sha256, size_bytes, mime_type, "
                 "original_filename, duration_ms, sample_rate, channels, created_at "
-                "FROM meeting_files WHERE id = :id"
+                "FROM meeting_analyzer.meeting_files WHERE id = :id"
             ),
             {"id": file_id},
         )
@@ -83,7 +83,7 @@ def list_meeting_files(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
             text(
                 "SELECT id, meeting_id, kind, sha256, size_bytes, mime_type, "
                 "original_filename, duration_ms, sample_rate, channels, created_at "
-                "FROM meeting_files WHERE meeting_id = :m ORDER BY created_at"
+                "FROM meeting_analyzer.meeting_files WHERE meeting_id = :m ORDER BY created_at"
             ),
             {"m": meeting_id},
         )
@@ -106,7 +106,7 @@ def upload_attachment(
     """Attach a document or image (50 MB max, allowlisted types)."""
 
     if conn.execute(
-        text("SELECT 1 FROM meetings WHERE id = :m"), {"m": meeting_id}
+        text("SELECT 1 FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
     ).scalar_one_or_none() is None:
         raise errors.not_found("meeting_not_found", "Meeting not found.")
 
@@ -123,7 +123,7 @@ def upload_attachment(
     row = (
         conn.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, original_filename) VALUES "
                 "(gen_random_uuid(), :m, 'attachment', :oid, :sha, :size, :mime, :name) "
                 "RETURNING id, meeting_id, kind, sha256, size_bytes, mime_type, "
@@ -246,7 +246,7 @@ def delete_file(
 
     result = conn.execute(
         text(
-            "DELETE FROM meeting_files WHERE id = :id AND kind = 'attachment'"
+            "DELETE FROM meeting_analyzer.meeting_files WHERE id = :id AND kind = 'attachment'"
         ),
         {"id": file_id},
     )

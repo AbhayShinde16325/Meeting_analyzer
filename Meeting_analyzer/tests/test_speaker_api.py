@@ -168,7 +168,7 @@ def _insert_diarized_transcript(pg_engine, meeting_id: str) -> str:
         return str(
             conn.execute(
                 text(
-                    "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                    "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, "
                     "is_primary, text, segments) VALUES (gen_random_uuid(), :m, "
                     "'fake', 'fake-model', true, 'diarized text', "
                     "CAST(:segments AS jsonb)) RETURNING id"
@@ -251,7 +251,7 @@ class TestProfilingJob:
         with pg_engine.begin() as conn:
             conn.execute(
                 text(
-                    "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                    "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, "
                     "is_primary, text, segments) VALUES (gen_random_uuid(), :m, "
                     "'fake', 'fake-model', true, 'plain', CAST('[]' AS jsonb))"
                 ),
@@ -469,7 +469,7 @@ class TestMatchingAndReview:
         with pg_engine.begin() as conn:
             conn.execute(
                 text(
-                    "INSERT INTO transcripts (id, meeting_id, provider, model, "
+                    "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, "
                     "is_primary, text, segments) VALUES (gen_random_uuid(), :m, "
                     "'fake', 'fake-model', true, 'split diarization', "
                     "CAST(:segments AS jsonb))"

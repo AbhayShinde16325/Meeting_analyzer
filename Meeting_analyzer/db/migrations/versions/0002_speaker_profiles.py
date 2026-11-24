@@ -1,63 +1,62 @@
 """Add voice speaker profiles, embeddings, and assignments.
 
-Voice Profiling V1:
-
-* ``speaker_profiles`` — persistent people, named only by users.
-* ``speaker_embeddings`` — one voice embedding per (transcript, local
-  diarization label); linked to a profile only after user confirmation.
-* ``speaker_assignments`` — user-reviewable mapping from a meeting-local
-  speaker label to a profile with suggested/confirmed/rejected state.
-* ``processing_jobs.job_type`` gains the ``'profiling'`` value.
-
-``0001_initial`` bootstraps the schema with ``Base.metadata.create_all``,
-which already creates these tables on a *fresh* database (the models exist
-by then).  The creates below are therefore checkfirst: they apply cleanly
-both on databases stamped at ``0001_initial`` (pre-speaker tables) and on
-fresh ones.
+Schema-aware migration for ``meeting_analyzer``. Works with independent
+``meeting_analyzer.alembic_version`` and does not touch Task Manager public tables.
 """
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 from alembic import op
-from sqlalchemy import Uuid, text
-from sqlalchemy.dialects.postgresql import JSONB
+import sqlalchemy as sa
+from sqlalchemy import inspect
 
-import db.models  # noqa: F401  (populates Base.metadata)
-from db.base import Base
+from db.base import MEETING_ANALYZER_SCHEMA, Base
+
+# Import models so metadata is populated.
+import db.models  # noqa: F401
 
 revision = "0002_speaker_profiles"
 down_revision = "0001_initial"
+branch_labels = None
+depends_on = None
 
 _TABLES = ("speaker_profiles", "speaker_embeddings", "speaker_assignments")
-
 _JOB_TYPE_CHECK = "ck_processing_jobs_job_type_allowed"
+_JOB_TYPE_OLD = "('transcription', 'analysis')"
+_JOB_TYPE_NEW = "('transcription', 'analysis', 'profiling')"
 
 
-def _speaker_tables():
-    return [Base.metadata.tables[name] for name in _TABLES]
+def _table_exists(inspector, table: str) -> bool:
+    try:
+        return inspector.has_table(table, schema=MEETING_ANALYZER_SCHEMA)
+    except Exception:
+        return False
 
 
 def upgrade() -> None:
     bind = op.get_bind()
-    Base.metadata.create_all(bind, tables=_speaker_tables(), checkfirst=True)
+    inspector = inspect(bind)
+    op.execute(f"CREATE SCHEMA IF NOT EXISTS {MEETING_ANALYZER_SCHEMA}")
 
+    for name in _TABLES:
+        if not _table_exists(inspector, name):
+            Base.metadata.tables[f"{MEETING_ANALYZER_SCHEMA}.{name}"].create(bind=bind, checkfirst=True)
+            inspector = inspect(bind)
+
+    # Expand processing_jobs.job_type check constraint in meeting_analyzer schema.
     op.execute(
-        f"ALTER TABLE processing_jobs DROP CONSTRAINT IF EXISTS {_JOB_TYPE_CHECK}"
+        f"ALTER TABLE {MEETING_ANALYZER_SCHEMA}.processing_jobs "
+        f"DROP CONSTRAINT IF EXISTS {_JOB_TYPE_CHECK}"
     )
     op.execute(
-        f"ALTER TABLE processing_jobs ADD CONSTRAINT {_JOB_TYPE_CHECK} "
-        "CHECK (job_type IN ('transcription', 'analysis', 'profiling'))"
+        f"ALTER TABLE {MEETING_ANALYZER_SCHEMA}.processing_jobs "
+        f"ADD CONSTRAINT {_JOB_TYPE_CHECK} CHECK (job_type IN {_JOB_TYPE_NEW})"
     )
 
 
 def downgrade() -> None:
-    op.execute(
-        f"ALTER TABLE processing_jobs DROP CONSTRAINT IF EXISTS {_JOB_TYPE_CHECK}"
+    # Non-destructive by default for shared production DB. Manual reviewed rollback only.
+    print(
+        "WARNING: downgrade for 0002_speaker_profiles is non-destructive and does not "
+        "drop meeting_analyzer speaker tables or alter Task Manager/public tables."
     )
-    op.execute(
-        f"ALTER TABLE processing_jobs ADD CONSTRAINT {_JOB_TYPE_CHECK} "
-        "CHECK (job_type IN ('transcription', 'analysis'))"
-    )
-    for name in reversed(_TABLES):
-        op.execute(f"DROP TABLE IF EXISTS {name}")

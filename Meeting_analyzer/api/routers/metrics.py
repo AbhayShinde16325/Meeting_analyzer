@@ -20,7 +20,7 @@ def get_meeting_metrics(meeting_id: uuid.UUID, conn: ConnDep) -> dict[str, Any] 
     """Metrics for the meeting's primary transcript, or null when absent."""
 
     if conn.execute(
-        text("SELECT 1 FROM meetings WHERE id = :m"), {"m": meeting_id}
+        text("SELECT 1 FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
     ).scalar_one_or_none() is None:
         raise errors.not_found("meeting_not_found", "Meeting not found.")
 
@@ -28,8 +28,8 @@ def get_meeting_metrics(meeting_id: uuid.UUID, conn: ConnDep) -> dict[str, Any] 
         conn.execute(
             text(
                 "SELECT tm.transcript_id, tm.metrics, tm.computed_at "
-                "FROM transcript_metrics tm "
-                "JOIN transcripts t ON t.id = tm.transcript_id "
+                "FROM meeting_analyzer.transcript_metrics tm "
+                "JOIN meeting_analyzer.transcripts t ON t.id = tm.transcript_id "
                 "WHERE tm.meeting_id = :m AND t.is_primary = true "
                 "ORDER BY tm.computed_at DESC LIMIT 1"
             ),

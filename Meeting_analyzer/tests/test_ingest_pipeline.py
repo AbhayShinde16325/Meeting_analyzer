@@ -39,7 +39,7 @@ def _user_id(conn, name="Pipeline User") -> str:
     return str(
         conn.execute(
             text(
-                "INSERT INTO users (id, display_name) VALUES (gen_random_uuid(), :n) "
+                "INSERT INTO meeting_analyzer.users (id, display_name) VALUES (gen_random_uuid(), :n) "
                 "RETURNING id"
             ),
             {"n": name},
@@ -49,15 +49,15 @@ def _user_id(conn, name="Pipeline User") -> str:
 
 def _meeting_and_job(conn, meeting_id: str) -> dict:
     meeting = conn.execute(
-        text("SELECT * FROM meetings WHERE id = :m"), {"m": meeting_id}
+        text("SELECT * FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
     ).mappings().one()
     files = conn.execute(
-        text("SELECT kind, size_bytes, sha256 FROM meeting_files WHERE meeting_id = :m "
+        text("SELECT kind, size_bytes, sha256 FROM meeting_analyzer.meeting_files WHERE meeting_id = :m "
              "ORDER BY kind"),
         {"m": meeting_id},
     ).mappings().all()
     jobs = conn.execute(
-        text("SELECT job_type, status FROM processing_jobs WHERE meeting_id = :m"),
+        text("SELECT job_type, status FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m"),
         {"m": meeting_id},
     ).mappings().all()
     return {"meeting": dict(meeting), "files": [dict(f) for f in files],
@@ -99,7 +99,7 @@ class TestIngest:
         row = pg.execute(
             text(
                 "SELECT sample_rate, channels, size_bytes, sha256, lo_oid FROM "
-                "meeting_files WHERE meeting_id = :m AND kind = 'derived_audio_16k'"
+                "meeting_analyzer.meeting_files WHERE meeting_id = :m AND kind = 'derived_audio_16k'"
             ),
             {"m": meeting_id},
         ).mappings().one()
@@ -109,7 +109,7 @@ class TestIngest:
         # The 16 kHz derivative must be smaller than the 48 kHz stereo original.
         original_size = pg.execute(
             text(
-                "SELECT size_bytes FROM meeting_files WHERE meeting_id = :m AND "
+                "SELECT size_bytes FROM meeting_analyzer.meeting_files WHERE meeting_id = :m AND "
                 "kind = 'original_audio_48k'"
             ),
             {"m": meeting_id},
@@ -129,7 +129,7 @@ class TestIngest:
         )
         pg.commit()
         jobs = pg.execute(
-            text("SELECT job_type, status FROM processing_jobs WHERE meeting_id = :m"),
+            text("SELECT job_type, status FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m"),
             {"m": meeting_id},
         ).mappings().all()
         assert [(j["job_type"], j["status"]) for j in jobs] == [
@@ -208,7 +208,7 @@ def ingested_meeting(pg, wav_factory):
     pg.commit()
     job_id = pg.execute(
         text(
-            "SELECT id FROM processing_jobs WHERE meeting_id = :m AND "
+            "SELECT id FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
             "job_type = 'transcription'"
         ),
         {"m": meeting_id},
@@ -228,7 +228,7 @@ class TestTranscriptionPipeline:
 
         row = pg.execute(
             text(
-                "SELECT provider, model, is_primary, text, language FROM transcripts "
+                "SELECT provider, model, is_primary, text, language FROM meeting_analyzer.transcripts "
                 "WHERE meeting_id = :m"
             ),
             {"m": meeting_id},
@@ -238,11 +238,11 @@ class TestTranscriptionPipeline:
         assert row[0]["provider"] == "stub"
         assert row[0]["text"].startswith("Alice:")
         status = pg.execute(
-            text("SELECT status FROM meetings WHERE id = :m"), {"m": meeting_id}
+            text("SELECT status FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
         ).scalar_one()
         assert status == "transcribed"
         job_status = pg.execute(
-            text("SELECT status, error FROM processing_jobs WHERE id = :id"),
+            text("SELECT status, error FROM meeting_analyzer.processing_jobs WHERE id = :id"),
             {"id": job_id},
         ).mappings().one()
         assert job_status["status"] == "succeeded"
@@ -264,7 +264,7 @@ class TestTranscriptionPipeline:
 
         row = pg.execute(
             text(
-                "SELECT provider, is_primary, fallback_from FROM transcripts WHERE "
+                "SELECT provider, is_primary, fallback_from FROM meeting_analyzer.transcripts WHERE "
                 "meeting_id = :m"
             ),
             {"m": meeting_id},
@@ -284,7 +284,7 @@ class TestTranscriptionPipeline:
         second_id = str(
             pg.execute(
                 text(
-                    "INSERT INTO processing_jobs (id, meeting_id, job_type, status) "
+                    "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status) "
                     "VALUES (gen_random_uuid(), :m, 'transcription', 'queued') "
                     "RETURNING id"
                 ),
@@ -296,12 +296,12 @@ class TestTranscriptionPipeline:
         pg.commit()
         primaries = pg.execute(
             text(
-                "SELECT COUNT(*) FROM transcripts WHERE meeting_id = :m AND is_primary"
+                "SELECT COUNT(*) FROM meeting_analyzer.transcripts WHERE meeting_id = :m AND is_primary"
             ),
             {"m": meeting_id},
         ).scalar_one()
         total = pg.execute(
-            text("SELECT COUNT(*) FROM transcripts WHERE meeting_id = :m"),
+            text("SELECT COUNT(*) FROM meeting_analyzer.transcripts WHERE meeting_id = :m"),
             {"m": meeting_id},
         ).scalar_one()
         assert primaries == 1
@@ -317,13 +317,13 @@ class TestTranscriptionPipeline:
         pipeline.run_job(job_id)
         pg.commit()
         status, error = pg.execute(
-            text("SELECT status, error FROM processing_jobs WHERE id = :id"),
+            text("SELECT status, error FROM meeting_analyzer.processing_jobs WHERE id = :id"),
             {"id": job_id},
         ).one()
         assert status == "failed"
         assert error is not None
         assert pg.execute(
-            text("SELECT COUNT(*) FROM transcripts WHERE meeting_id = :m"),
+            text("SELECT COUNT(*) FROM meeting_analyzer.transcripts WHERE meeting_id = :m"),
             {"m": meeting_id},
         ).scalar_one() == 0
 
@@ -339,11 +339,11 @@ class TestTranscriptionPipeline:
         pipeline.run_job(job_id)
         pg.commit()
         status = pg.execute(
-            text("SELECT status FROM processing_jobs WHERE id = :id"), {"id": job_id}
+            text("SELECT status FROM meeting_analyzer.processing_jobs WHERE id = :id"), {"id": job_id}
         ).scalar_one()
         assert status == "cancelled"
         assert pg.execute(
-            text("SELECT COUNT(*) FROM transcripts WHERE meeting_id = :m"),
+            text("SELECT COUNT(*) FROM meeting_analyzer.transcripts WHERE meeting_id = :m"),
             {"m": meeting_id},
         ).scalar_one() == 0
 
@@ -365,7 +365,7 @@ class TestTranscriptionPipeline:
                     # Mark cancelled externally, then let the provider see it.
                     pg.execute(
                         text(
-                            "UPDATE processing_jobs SET status = 'cancelled' WHERE id = :id"
+                            "UPDATE meeting_analyzer.processing_jobs SET status = 'cancelled' WHERE id = :id"
                         ),
                         {"id": job_id},
                     )
@@ -382,7 +382,7 @@ class TestTranscriptionPipeline:
         pg.commit()
         assert observed["cancel_cb"] is not None
         status = pg.execute(
-            text("SELECT status FROM processing_jobs WHERE id = :id"), {"id": job_id}
+            text("SELECT status FROM meeting_analyzer.processing_jobs WHERE id = :id"), {"id": job_id}
         ).scalar_one()
         assert status == "cancelled"
 
@@ -406,7 +406,7 @@ class TestAnalysisPipeline:
         analysis_job_id = str(
             pg.execute(
                 text(
-                    "INSERT INTO processing_jobs (id, meeting_id, job_type, status) "
+                    "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status) "
                     "VALUES (gen_random_uuid(), :m, 'analysis', 'queued') RETURNING id"
                 ),
                 {"m": meeting_id},
@@ -424,13 +424,13 @@ class TestAnalysisPipeline:
         assert "Ship the release on Friday" in analysis_provider.calls[0]["user_prompt"]
 
         summary = pg.execute(
-            text("SELECT overview, payload, model FROM summaries WHERE meeting_id = :m"),
+            text("SELECT overview, payload, model FROM meeting_analyzer.summaries WHERE meeting_id = :m"),
             {"m": meeting_id},
         ).mappings().one()
         assert summary["overview"] == "The team agreed to ship the release."
         item = pg.execute(
             text(
-                "SELECT task, owner, deadline, evidence, status FROM action_items "
+                "SELECT task, owner, deadline, evidence, status FROM meeting_analyzer.action_items "
                 "WHERE meeting_id = :m"
             ),
             {"m": meeting_id},
@@ -439,11 +439,11 @@ class TestAnalysisPipeline:
         assert item["deadline"] == "Friday"
         assert item["status"] == "open"
         status = pg.execute(
-            text("SELECT status FROM meetings WHERE id = :m"), {"m": meeting_id}
+            text("SELECT status FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
         ).scalar_one()
         assert status == "completed"
         job_status = pg.execute(
-            text("SELECT status FROM processing_jobs WHERE id = :id"),
+            text("SELECT status FROM meeting_analyzer.processing_jobs WHERE id = :id"),
             {"id": analysis_job_id},
         ).scalar_one()
         assert job_status == "succeeded"
@@ -458,7 +458,7 @@ class TestAnalysisPipeline:
         analysis_job_id = str(
             pg.execute(
                 text(
-                    "INSERT INTO processing_jobs (id, meeting_id, job_type, status) "
+                    "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status) "
                     "VALUES (gen_random_uuid(), :m, 'analysis', 'queued') RETURNING id"
                 ),
                 {"m": meeting_id},
@@ -469,7 +469,7 @@ class TestAnalysisPipeline:
         pipeline.run_job(analysis_job_id)
         pg.commit()
         status, error = pg.execute(
-            text("SELECT status, error FROM processing_jobs WHERE id = :id"),
+            text("SELECT status, error FROM meeting_analyzer.processing_jobs WHERE id = :id"),
             {"id": analysis_job_id},
         ).one()
         assert status == "failed"

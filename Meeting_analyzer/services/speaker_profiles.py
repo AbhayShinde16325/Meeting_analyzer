@@ -266,7 +266,7 @@ class SpeakerProfileService:
                 "Voice profiling is disabled. Set TEAMMEETINGAI_VOICE_PROFILING=1 and install resemblyzer."
             )
         with self._engine.begin() as conn:
-            exists = conn.execute(text("SELECT id, display_name FROM speaker_profiles WHERE id=:p"), {"p": profile_id}).mappings().one_or_none()
+            exists = conn.execute(text("SELECT id, display_name FROM meeting_analyzer.speaker_profiles WHERE id=:p"), {"p": profile_id}).mappings().one_or_none()
             if exists is None:
                 raise SpeakerProfilingError("Speaker profile not found.")
         encoder = self._get_encoder()
@@ -288,18 +288,18 @@ class SpeakerProfileService:
             # we create a hidden enrollment transcript/meeting-less linkage is not possible, so attach to a synthetic
             # enrollment meeting owned by no user? Instead, create enrollment rows in a lightweight way by using a
             # dedicated enrollment meeting/transcript per profile sample.
-            user_id = conn.execute(text("SELECT id FROM users ORDER BY created_at LIMIT 1")).scalar_one_or_none()
+            user_id = conn.execute(text("SELECT id FROM meeting_analyzer.users ORDER BY created_at LIMIT 1")).scalar_one_or_none()
             if user_id is None:
                 raise SpeakerProfilingError("Create a user/profile before enrolling speaker voice samples.")
             meeting_id = conn.execute(text(
-                "INSERT INTO meetings (id, user_id, title, status) VALUES (gen_random_uuid(), :u, :t, 'completed') RETURNING id"
+                "INSERT INTO meeting_analyzer.meetings (id, user_id, title, status) VALUES (gen_random_uuid(), :u, :t, 'completed') RETURNING id"
             ), {"u": user_id, "t": f"Voice enrollment: {exists['display_name']}"}).scalar_one()
             transcript_id = conn.execute(text(
-                "INSERT INTO transcripts (id, meeting_id, provider, model, is_primary, text, segments) "
+                "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, is_primary, text, segments) "
                 "VALUES (gen_random_uuid(), :m, 'enrollment', 'resemblyzer-ge2e', false, :txt, CAST(:seg AS jsonb)) RETURNING id"
             ), {"m": meeting_id, "txt": "Voice enrollment sample", "seg": _json([{"start":0.0,"end":round(seconds,3),"text":"enrollment","speaker":"Enrollment"}])}).scalar_one()
             conn.execute(text(
-                "INSERT INTO speaker_embeddings (id, meeting_id, transcript_id, local_label, embedding, source_seconds, profile_id) "
+                "INSERT INTO meeting_analyzer.speaker_embeddings (id, meeting_id, transcript_id, local_label, embedding, source_seconds, profile_id) "
                 "VALUES (gen_random_uuid(), :m, :t, 'Enrollment', CAST(:e AS jsonb), :s, :p)"
             ), {"m": meeting_id, "t": transcript_id, "e": _json(embedding), "s": float(seconds), "p": profile_id})
         return {"profile_id": profile_id, "display_name": exists["display_name"], "seconds": round(seconds,3), "embedding_count": self.profile_embedding_count(profile_id)}
@@ -341,13 +341,13 @@ class SpeakerProfileService:
             # Re-profiling the same transcript replaces its embeddings, but
             # user decisions in speaker_assignments always survive.
             conn.execute(
-                text("DELETE FROM speaker_embeddings WHERE transcript_id = :t"),
+                text("DELETE FROM meeting_analyzer.speaker_embeddings WHERE transcript_id = :t"),
                 {"t": transcript_id},
             )
             for item in label_embeddings:
                 conn.execute(
                     text(
-                        "INSERT INTO speaker_embeddings (id, meeting_id, "
+                        "INSERT INTO meeting_analyzer.speaker_embeddings (id, meeting_id, "
                         "transcript_id, local_label, embedding, source_seconds) "
                         "VALUES (gen_random_uuid(), :m, :t, :label, "
                         "CAST(:embedding AS jsonb), :seconds)"
@@ -370,7 +370,7 @@ class SpeakerProfileService:
                     continue
                 conn.execute(
                     text(
-                        "INSERT INTO speaker_assignments (id, meeting_id, "
+                        "INSERT INTO meeting_analyzer.speaker_assignments (id, meeting_id, "
                         "transcript_id, local_label, profile_id, confidence, status) "
                         "VALUES (gen_random_uuid(), :m, :t, :label, :profile, "
                         ":confidence, 'suggested') "
@@ -396,7 +396,7 @@ class SpeakerProfileService:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT profile_id, embedding FROM speaker_embeddings "
+                    "SELECT profile_id, embedding FROM meeting_analyzer.speaker_embeddings "
                     "WHERE profile_id IS NOT NULL"
                 )
             ).all()
@@ -441,7 +441,7 @@ class SpeakerProfileService:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT id, display_name FROM speaker_profiles "
+                    "SELECT id, display_name FROM meeting_analyzer.speaker_profiles "
                     "WHERE id = ANY(CAST(:ids AS uuid[]))"
                 ),
                 {"ids": profile_ids},
@@ -460,7 +460,7 @@ class SpeakerProfileService:
         with self._engine.begin() as conn:
             transcript = conn.execute(
                 text(
-                    "SELECT id, segments FROM transcripts WHERE meeting_id = :m "
+                    "SELECT id, segments FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
                     "AND is_primary = true"
                 ),
                 {"m": meeting_id},
@@ -489,7 +489,7 @@ class SpeakerProfileService:
                 for row in conn.execute(
                     text(
                         "SELECT id, local_label, embedding, source_seconds, profile_id "
-                        "FROM speaker_embeddings WHERE transcript_id = :t"
+                        "FROM meeting_analyzer.speaker_embeddings WHERE transcript_id = :t"
                     ),
                     {"t": transcript["id"]},
                 ).mappings()
@@ -499,7 +499,7 @@ class SpeakerProfileService:
                 for row in conn.execute(
                     text(
                         "SELECT id, local_label, profile_id, confidence, status "
-                        "FROM speaker_assignments WHERE transcript_id = :t"
+                        "FROM meeting_analyzer.speaker_assignments WHERE transcript_id = :t"
                     ),
                     {"t": transcript["id"]},
                 ).mappings()
@@ -634,7 +634,7 @@ class SpeakerProfileService:
         with self._engine.begin() as conn:
             transcript = conn.execute(
                 text(
-                    "SELECT id FROM transcripts WHERE meeting_id = :m "
+                    "SELECT id FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
                     "AND is_primary = true"
                 ),
                 {"m": meeting_id},
@@ -651,7 +651,7 @@ class SpeakerProfileService:
                 assert profile_id is not None
                 conn.execute(
                     text(
-                        "UPDATE speaker_embeddings SET profile_id = :p "
+                        "UPDATE meeting_analyzer.speaker_embeddings SET profile_id = :p "
                         "WHERE transcript_id = :t AND local_label = :label"
                     ),
                     {"p": profile_id, "t": transcript_id, "label": local_label},
@@ -659,7 +659,7 @@ class SpeakerProfileService:
 
             row = conn.execute(
                 text(
-                    "INSERT INTO speaker_assignments (id, meeting_id, transcript_id, "
+                    "INSERT INTO meeting_analyzer.speaker_assignments (id, meeting_id, transcript_id, "
                     "local_label, profile_id, confidence, status) "
                     "VALUES (gen_random_uuid(), :m, :t, :label, :profile, "
                     "CAST(:confidence AS double precision), :status) "
@@ -690,8 +690,8 @@ class SpeakerProfileService:
                 text(
                     "SELECT p.id, p.display_name, p.created_at, "
                     "COUNT(e.id) AS embedding_count "
-                    "FROM speaker_profiles p "
-                    "LEFT JOIN speaker_embeddings e ON e.profile_id = p.id "
+                    "FROM meeting_analyzer.speaker_profiles p "
+                    "LEFT JOIN meeting_analyzer.speaker_embeddings e ON e.profile_id = p.id "
                     "GROUP BY p.id, p.display_name, p.created_at "
                     "ORDER BY p.display_name"
                 )
@@ -704,7 +704,7 @@ class SpeakerProfileService:
             raise SpeakerProfilingError("A profile name is required.")
         with self._engine.begin() as conn:
             existing = conn.execute(
-                text("SELECT id FROM speaker_profiles WHERE display_name = :n"),
+                text("SELECT id FROM meeting_analyzer.speaker_profiles WHERE display_name = :n"),
                 {"n": name},
             ).scalar_one_or_none()
             if existing is not None:
@@ -713,7 +713,7 @@ class SpeakerProfileService:
                 )
             row = conn.execute(
                 text(
-                    "INSERT INTO speaker_profiles (id, display_name) "
+                    "INSERT INTO meeting_analyzer.speaker_profiles (id, display_name) "
                     "VALUES (gen_random_uuid(), :n) "
                     "RETURNING id, display_name, created_at"
                 ),
@@ -728,7 +728,7 @@ class SpeakerProfileService:
         with self._engine.begin() as conn:
             clash = conn.execute(
                 text(
-                    "SELECT id FROM speaker_profiles "
+                    "SELECT id FROM meeting_analyzer.speaker_profiles "
                     "WHERE display_name = :n AND id <> :p"
                 ),
                 {"n": name, "p": profile_id},
@@ -739,7 +739,7 @@ class SpeakerProfileService:
                 )
             row = conn.execute(
                 text(
-                    "UPDATE speaker_profiles SET display_name = :n, updated_at = now() "
+                    "UPDATE meeting_analyzer.speaker_profiles SET display_name = :n, updated_at = now() "
                     "WHERE id = :p "
                     "RETURNING id, display_name, created_at, updated_at"
                 ),
@@ -756,7 +756,7 @@ class SpeakerProfileService:
             return int(
                 conn.execute(
                     text(
-                        "SELECT COUNT(*) FROM speaker_embeddings "
+                        "SELECT COUNT(*) FROM meeting_analyzer.speaker_embeddings "
                         "WHERE profile_id = :p"
                     ),
                     {"p": profile_id},
@@ -768,7 +768,7 @@ class SpeakerProfileService:
 
         with self._engine.begin() as conn:
             result = conn.execute(
-                text("DELETE FROM speaker_profiles WHERE id = :p"),
+                text("DELETE FROM meeting_analyzer.speaker_profiles WHERE id = :p"),
                 {"p": profile_id},
             )
         if result.rowcount == 0:

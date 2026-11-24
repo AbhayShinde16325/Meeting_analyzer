@@ -34,7 +34,9 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://${TEAMMEETINGAI_PG_USER:-tma}:${TEAMMEETINGAI_PG_PASSWORD:?set TEAMMEETINGAI_PG_PASSWORD in .env}@db:5432/${TEAMMEETINGAI_PG_DB:-teammeetingai}
+      # Default local-dev DB. For shared Supabase, set DATABASE_URL in .env to the
+      # same Supabase connection string used by Task Manager and remove/override this.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${TEAMMEETINGAI_PG_USER:-tma}:${TEAMMEETINGAI_PG_PASSWORD:?set TEAMMEETINGAI_PG_PASSWORD in .env}@db:5432/${TEAMMEETINGAI_PG_DB:-teammeetingai}}
       TEAMMEETINGAI_API_HOST: 0.0.0.0
       TEAMMEETINGAI_API_PORT: 8000
       TEAMMEETINGAI_STATIC_DIR: /app/client-dist

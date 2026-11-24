@@ -2,6 +2,14 @@
 
 `Meeting_analyzer/` contains the **FastAPI backend** for TeamMeetingAI. The sole frontend is the React application in `../client/`.
 
+## Shared Supabase Schema Isolation
+
+- Uses same `DATABASE_URL` as Task Manager.
+- Task Manager tables stay in `public` (untouched).
+- Meeting Analyzer tables live in `meeting_analyzer` schema.
+- Meeting Analyzer Alembic version table: `meeting_analyzer.alembic_version`.
+- PostgreSQL Large Objects and `meeting_files` LO unlink trigger are preserved.
+
 ## Responsibilities
 
 - FastAPI API (`api/`) for meetings, files, transcripts, summaries, action items, jobs, speakers, metrics, search, and system status.

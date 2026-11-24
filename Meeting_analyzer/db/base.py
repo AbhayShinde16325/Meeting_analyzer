@@ -3,12 +3,18 @@
 The naming convention keeps auto-generated constraint names predictable, which
 matters for Alembic migrations and for deterministic ``DROP``/``CASCADE``
 behaviour in tests.
+
+All Meeting Analyzer tables live in the dedicated ``meeting_analyzer`` schema
+to coexist safely with existing Task Manager tables in ``public`` in the same
+Supabase/PostgreSQL database.
 """
 
 from __future__ import annotations
 
 from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
+
+MEETING_ANALYZER_SCHEMA = "meeting_analyzer"
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -18,7 +24,7 @@ NAMING_CONVENTION = {
     "pk": "pk_%(table_name)s",
 }
 
-metadata = MetaData(naming_convention=NAMING_CONVENTION)
+metadata = MetaData(schema=MEETING_ANALYZER_SCHEMA, naming_convention=NAMING_CONVENTION)
 
 
 class Base(DeclarativeBase):

@@ -31,7 +31,7 @@ profiles_router = APIRouter(prefix="/profiles", tags=["speakers"])
 
 def _meeting_exists(conn, meeting_id) -> None:
     if conn.execute(
-        text("SELECT 1 FROM meetings WHERE id = :m"), {"m": meeting_id}
+        text("SELECT 1 FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
     ).scalar_one_or_none() is None:
         raise errors.not_found("meeting_not_found", "Meeting not found.")
 
@@ -72,7 +72,7 @@ def assign_meeting_speaker(
     _meeting_exists(conn, meeting_id)
     if payload.profile_id is not None:
         exists = conn.execute(
-            text("SELECT 1 FROM speaker_profiles WHERE id = :p"),
+            text("SELECT 1 FROM meeting_analyzer.speaker_profiles WHERE id = :p"),
             {"p": payload.profile_id},
         ).scalar_one_or_none()
         if exists is None:
@@ -111,7 +111,7 @@ def request_profiling(
         )
     primary = conn.execute(
         text(
-            "SELECT 1 FROM transcripts WHERE meeting_id = :m AND is_primary = true"
+            "SELECT 1 FROM meeting_analyzer.transcripts WHERE meeting_id = :m AND is_primary = true"
         ),
         {"m": meeting_id},
     ).scalar_one_or_none()
@@ -121,7 +121,7 @@ def request_profiling(
         )
     active = conn.execute(
         text(
-            "SELECT 1 FROM processing_jobs WHERE meeting_id = :m AND "
+            "SELECT 1 FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
             "job_type = 'profiling' AND status IN ('queued', 'running')"
         ),
         {"m": meeting_id},
@@ -131,7 +131,7 @@ def request_profiling(
     row = (
         conn.execute(
             text(
-                "INSERT INTO processing_jobs (id, meeting_id, job_type, status, message) "
+                "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
                 "VALUES (gen_random_uuid(), :m, 'profiling', 'queued', "
                 "'Queued for voice profiling') RETURNING id, meeting_id, job_type, "
                 "status, progress, message, error, provider, model, fallback_from, "

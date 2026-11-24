@@ -295,7 +295,7 @@ def ingest_recording(
 
         meeting_id = conn.execute(
             text(
-                "INSERT INTO meetings (user_id, title, status, duration_ms) VALUES "
+                "INSERT INTO meeting_analyzer.meetings (user_id, title, status, duration_ms) VALUES "
                 "(:user_id, :title, 'recorded', :duration_ms) RETURNING id"
             ),
             {"user_id": user_id, "title": title, "duration_ms": effective_duration_ms},
@@ -304,7 +304,7 @@ def ingest_recording(
         original_oid, original_sha, original_size = lo.create_lo_from_file(conn, upload_path)
         conn.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, duration_ms, sample_rate, channels, "
                 "original_filename) VALUES (gen_random_uuid(), :meeting_id, "
                 "'original_audio_48k', :oid, :sha, :size, :mime, :duration_ms, "
@@ -328,7 +328,7 @@ def ingest_recording(
         derived_oid, derived_sha, derived_size = lo.create_lo_from_file(conn, derived_path)
         conn.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, duration_ms, sample_rate, channels, "
                 "original_filename) VALUES (gen_random_uuid(), :meeting_id, "
                 "'derived_audio_16k', :oid, :sha, :size, 'audio/wav', :duration_ms, "
@@ -346,7 +346,7 @@ def ingest_recording(
 
         conn.execute(
             text(
-                "INSERT INTO processing_jobs (id, meeting_id, job_type, status, message) "
+                "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
                 "VALUES (gen_random_uuid(), :meeting_id, 'transcription', 'queued', "
                 "'Queued for transcription')"
             ),
@@ -367,7 +367,7 @@ def ingest_recording(
 def _store_audio_file(conn, meeting_id: str, path: Path, *, kind: str, mime_type: str, filename: str, duration_ms: int | None = None, sample_rate: int | None = None, channels: int | None = None) -> None:
     oid, sha256, size = lo.create_lo_from_file(conn, path)
     conn.execute(text(
-        "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, size_bytes, mime_type, "
+        "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, size_bytes, mime_type, "
         "duration_ms, sample_rate, channels, original_filename) VALUES (gen_random_uuid(), :meeting_id, :kind, "
         ":oid, :sha, :size, :mime, :duration_ms, :sample_rate, :channels, :filename)"
     ), {
@@ -425,7 +425,7 @@ def ingest_multi_source_recording(
             mix_duration_ms = round(mix_frames * 1000 / mix_rate) if mix_rate else duration_ms
 
         meeting_id = conn.execute(text(
-            "INSERT INTO meetings (user_id, title, status, duration_ms, notes, capture_mode, capture_manifest) "
+            "INSERT INTO meeting_analyzer.meetings (user_id, title, status, duration_ms, notes, capture_mode, capture_manifest) "
             "VALUES (:user_id, :title, 'recorded', :duration_ms, :notes, :capture_mode, CAST(:manifest AS jsonb)) RETURNING id"
         ), {
             "user_id": user_id, "title": title, "duration_ms": mix_duration_ms or duration_ms, "notes": notes,
@@ -455,7 +455,7 @@ def ingest_multi_source_recording(
                           filename=derived.name, duration_ms=d_ms, sample_rate=d_rate, channels=d_ch)
 
         conn.execute(text(
-            "INSERT INTO processing_jobs (id, meeting_id, job_type, status, message) "
+            "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
             "VALUES (gen_random_uuid(), :meeting_id, 'transcription', 'queued', 'Queued for transcription')"
         ), {"meeting_id": meeting_id})
         conn.commit()

@@ -73,7 +73,7 @@ class _LargeObjectFile(io.RawIOBase):
 def _meeting_rows(conn: Connection, meeting_id: uuid.UUID) -> dict:
     row = (
         conn.execute(
-            text("SELECT * FROM meetings WHERE id = :m"), {"m": meeting_id}
+            text("SELECT * FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
         )
         .mappings()
         .one_or_none()
@@ -93,7 +93,7 @@ def build_export(
         conn.execute(
             text(
                 "SELECT kind, lo_oid, sha256, size_bytes, mime_type, "
-                "original_filename, sample_rate, channels FROM meeting_files "
+                "original_filename, sample_rate, channels FROM meeting_analyzer.meeting_files "
                 "WHERE meeting_id = :m ORDER BY created_at"
             ),
             {"m": meeting_id},
@@ -105,7 +105,7 @@ def build_export(
         conn.execute(
             text(
                 "SELECT provider, model, mode, is_primary, fallback_from, text, "
-                "segments, created_at FROM transcripts WHERE meeting_id = :m "
+                "segments, created_at FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
                 "ORDER BY is_primary DESC, created_at"
             ),
             {"m": meeting_id},
@@ -116,7 +116,7 @@ def build_export(
     summary = (
         conn.execute(
             text(
-                "SELECT overview, payload, model, created_at FROM summaries "
+                "SELECT overview, payload, model, created_at FROM meeting_analyzer.summaries "
                 "WHERE meeting_id = :m"
             ),
             {"m": meeting_id},
@@ -127,7 +127,7 @@ def build_export(
     action_items = (
         conn.execute(
             text(
-                "SELECT task, owner, deadline, evidence, status FROM action_items "
+                "SELECT task, owner, deadline, evidence, status FROM meeting_analyzer.action_items "
                 "WHERE meeting_id = :m ORDER BY position"
             ),
             {"m": meeting_id},

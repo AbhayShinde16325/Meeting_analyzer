@@ -160,7 +160,7 @@ def start_run(url: str) -> Any:
     try:
         with engine.begin() as conn:
             return conn.execute(
-                text("INSERT INTO backup_runs (status) VALUES ('running') RETURNING id")
+                text("INSERT INTO meeting_analyzer.backup_runs (status) VALUES ('running') RETURNING id")
             ).scalar_one()
     finally:
         engine.dispose()
@@ -182,7 +182,7 @@ def finish_run(
         with engine.begin() as conn:
             conn.execute(
                 text(
-                    "UPDATE backup_runs SET status = :status, output_path = "
+                    "UPDATE meeting_analyzer.backup_runs SET status = :status, output_path = "
                     ":output_path, size_bytes = :size_bytes, error = :error, "
                     "finished_at = now() WHERE id = :id"
                 ),

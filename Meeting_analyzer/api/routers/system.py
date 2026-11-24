@@ -19,10 +19,10 @@ def status(conn: ConnDep) -> dict:
     """Everything the dashboard footer and settings dialog need."""
 
     schema_version = conn.execute(
-        text("SELECT version_num FROM alembic_version")
+        text("SELECT version_num FROM meeting_analyzer.alembic_version")
     ).scalar_one_or_none()
     meeting_count = int(
-        conn.execute(text("SELECT COUNT(*) FROM meetings")).scalar_one()
+        conn.execute(text("SELECT COUNT(*) FROM meeting_analyzer.meetings")).scalar_one()
     )
     db_size = int(
         conn.execute(
@@ -33,7 +33,7 @@ def status(conn: ConnDep) -> dict:
         conn.execute(
             text(
                 "SELECT started_at, finished_at, status, output_path, size_bytes, "
-                "error FROM backup_runs ORDER BY started_at DESC LIMIT 1"
+                "error FROM meeting_analyzer.backup_runs ORDER BY started_at DESC LIMIT 1"
             )
         )
         .mappings()

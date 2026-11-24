@@ -36,7 +36,7 @@ def search(
                     "SELECT m.id AS meeting_id, m.title, m.recorded_at, "
                     "substring(t.text, GREATEST(1, position(lower(:q) IN "
                     "lower(t.text)) - 80), 220) AS snippet "
-                    "FROM transcripts t JOIN meetings m ON m.id = t.meeting_id "
+                    "FROM meeting_analyzer.transcripts t JOIN meeting_analyzer.meetings m ON m.id = t.meeting_id "
                     "WHERE t.is_primary AND t.text ILIKE :p "
                     "ORDER BY m.recorded_at DESC LIMIT :limit"
                 ),
@@ -53,7 +53,7 @@ def search(
                     "SELECT m.id AS meeting_id, m.title, m.recorded_at, "
                     "substring(s.overview, GREATEST(1, position(lower(:q) IN "
                     "lower(s.overview)) - 80), 220) AS snippet "
-                    "FROM summaries s JOIN meetings m ON m.id = s.meeting_id "
+                    "FROM meeting_analyzer.summaries s JOIN meeting_analyzer.meetings m ON m.id = s.meeting_id "
                     "WHERE s.overview ILIKE :p OR s.payload::text ILIKE :p "
                     "ORDER BY m.recorded_at DESC LIMIT :limit"
                 ),
@@ -69,7 +69,7 @@ def search(
                 text(
                     "SELECT m.id AS meeting_id, m.title, m.recorded_at, "
                     "a.task || ' — ' || COALESCE(a.owner, '') AS snippet "
-                    "FROM action_items a JOIN meetings m ON m.id = a.meeting_id "
+                    "FROM meeting_analyzer.action_items a JOIN meeting_analyzer.meetings m ON m.id = a.meeting_id "
                     "WHERE a.task ILIKE :p OR COALESCE(a.owner, '') ILIKE :p "
                     "ORDER BY m.recorded_at DESC LIMIT :limit"
                 ),

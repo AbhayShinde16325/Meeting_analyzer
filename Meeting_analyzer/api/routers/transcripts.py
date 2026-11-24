@@ -16,7 +16,7 @@ router = APIRouter(prefix="/meetings", tags=["transcripts"])
 
 def _meeting_exists(conn, meeting_id) -> None:
     if conn.execute(
-        text("SELECT 1 FROM meetings WHERE id = :m"), {"m": meeting_id}
+        text("SELECT 1 FROM meeting_analyzer.meetings WHERE id = :m"), {"m": meeting_id}
     ).scalar_one_or_none() is None:
         raise errors.not_found("meeting_not_found", "Meeting not found.")
 
@@ -29,7 +29,7 @@ def list_transcripts(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
             text(
                 "SELECT id, meeting_id, provider, model, mode, language, is_primary, "
                 "fallback_from, fallback_reason, text, segments, created_at "
-                "FROM transcripts WHERE meeting_id = :m ORDER BY created_at DESC"
+                "FROM meeting_analyzer.transcripts WHERE meeting_id = :m ORDER BY created_at DESC"
             ),
             {"m": meeting_id},
         )
@@ -49,7 +49,7 @@ def transcribe(
     _meeting_exists(conn, meeting_id)
     original = conn.execute(
         text(
-            "SELECT 1 FROM meeting_files WHERE meeting_id = :m AND "
+            "SELECT 1 FROM meeting_analyzer.meeting_files WHERE meeting_id = :m AND "
             "kind = 'original_audio_48k'"
         ),
         {"m": meeting_id},
@@ -60,7 +60,7 @@ def transcribe(
         )
     active = conn.execute(
         text(
-            "SELECT 1 FROM processing_jobs WHERE meeting_id = :m AND "
+            "SELECT 1 FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
             "job_type = 'transcription' AND status IN ('queued', 'running')"
         ),
         {"m": meeting_id},
@@ -70,7 +70,7 @@ def transcribe(
     row = (
         conn.execute(
             text(
-                "INSERT INTO processing_jobs (id, meeting_id, job_type, status, message) "
+                "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
                 "VALUES (gen_random_uuid(), :m, 'transcription', 'queued', "
                 "'Queued for transcription') RETURNING id, meeting_id, job_type, "
                 "status, progress, message, error, provider, model, fallback_from, "

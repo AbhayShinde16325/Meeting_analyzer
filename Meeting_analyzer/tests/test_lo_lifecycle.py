@@ -76,20 +76,20 @@ class TestDeletionAndOrphans:
         kept_oid, _sha = _store(pg, b"referenced")
         user = pg.execute(
             text(
-                "INSERT INTO users (id, display_name) VALUES (gen_random_uuid(), 'U') "
+                "INSERT INTO meeting_analyzer.users (id, display_name) VALUES (gen_random_uuid(), 'U') "
                 "RETURNING id"
             )
         ).mappings().one()
         meeting = pg.execute(
             text(
-                "INSERT INTO meetings (id, user_id, title) VALUES (gen_random_uuid(), "
+                "INSERT INTO meeting_analyzer.meetings (id, user_id, title) VALUES (gen_random_uuid(), "
                 ":user_id, 'M') RETURNING id"
             ),
             {"user_id": user["id"]},
         ).mappings().one()
         pg.execute(
             text(
-                "INSERT INTO meeting_files (id, meeting_id, kind, lo_oid, sha256, "
+                "INSERT INTO meeting_analyzer.meeting_files (id, meeting_id, kind, lo_oid, sha256, "
                 "size_bytes, mime_type, original_filename) VALUES (gen_random_uuid(), "
                 ":meeting_id, 'attachment', :oid, :sha, 10, 'text/plain', 'a.txt')"
             ),

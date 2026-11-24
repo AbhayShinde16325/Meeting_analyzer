@@ -68,7 +68,7 @@ def get_current_profile(
         ) from None
     row = (
         conn.execute(
-            text("SELECT id, display_name FROM users WHERE id = :id"),
+            text("SELECT id, display_name FROM meeting_analyzer.users WHERE id = :id"),
             {"id": profile_id},
         )
         .mappings()

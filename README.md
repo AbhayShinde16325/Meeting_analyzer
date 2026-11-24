@@ -29,6 +29,16 @@ fnw-meeting-analyzer/
 └── README.md
 ```
 
+### Shared Supabase/PostgreSQL (Task Manager + Meeting Analyzer)
+
+- Use the **same Supabase PostgreSQL `DATABASE_URL`** as the existing FNW Task Manager.
+- One database, one `DATABASE_URL`, no second PostgreSQL instance for Meeting Analyzer.
+- Task Manager remains in `public` schema and is **not modified** by Meeting Analyzer migrations.
+- Meeting Analyzer creates/uses `meeting_analyzer` schema for all its tables.
+- Alembic version tracking is independent:
+  - Task Manager: `public.alembic_version` (existing, untouched)
+  - Meeting Analyzer: `meeting_analyzer.alembic_version`
+
 ### Main components
 
 | Component | Responsibility |
