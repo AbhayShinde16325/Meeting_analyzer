@@ -56,8 +56,9 @@ def mix(mic: Path, sysa: Path, out: Path):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('--server', required=True); ap.add_argument('--host-token', required=True)
-    ap.add_argument('--user-id', required=True); ap.add_argument('--title', required=True)
+    ap.add_argument('--server', required=True)
+    ap.add_argument('--user-id', required=True)
+    ap.add_argument('--title', required=True)
     ap.add_argument('--mic-id', default=None); ap.add_argument('--system-id', default=None)
     ap.add_argument('--seconds', type=int, default=0)
     ap.add_argument('--out', default='capture_out')
@@ -82,7 +83,7 @@ def main():
     files={'microphone': open(mic_wav,'rb'),'system': open(sys_wav,'rb'),'mixed': open(mix_wav,'rb')}
     data={'title':args.title,'user_id':args.user_id,'duration_ms':str(int((time.time()-t0)*1000)),
           'source_manifest': json.dumps({'microphone':{'source':'wasapi_mic'},'system':{'source':'wasapi_loopback'}})}
-    r=requests.post(args.server.rstrip('/')+'/meetings/multi-source', headers={'X-Host-Token':args.host_token}, data=data, files=files, timeout=3600)
+    r=requests.post(args.server.rstrip('/')+'/meetings/multi-source', headers={}, data=data, files=files, timeout=3600)
     print(r.status_code, r.text[:500])
 
 if __name__=='__main__':

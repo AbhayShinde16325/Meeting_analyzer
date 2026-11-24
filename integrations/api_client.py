@@ -21,8 +21,6 @@ import httpx
 
 DEFAULT_SERVER_URL = "http://localhost:8000"
 SERVER_URL_ENV = "TEAMMEETINGAI_SERVER_URL"
-HOST_TOKEN_ENV = "TEAMMEETINGAI_HOST_TOKEN"
-HOST_TOKEN_HEADER = "X-Host-Token"
 _TIMEOUT_SECONDS = 30.0
 _UPLOAD_TIMEOUT_SECONDS = 3600.0  # multi-hour recordings
 _DOWNLOAD_CHUNK = 1024 * 1024
@@ -70,7 +68,6 @@ class TeamMeetingAIClient:
         self._profile_id = profile_id
         # The host token (shared .env on the meeting host machine) proves this
         # client may record and manage meetings.  Never sent by remote clients.
-        self._host_token = os.environ.get(HOST_TOKEN_ENV, "").strip()
 
     # -- configuration ---------------------------------------------------
 
@@ -87,31 +84,21 @@ class TeamMeetingAIClient:
 
         self._profile_id = profile_id
 
-    def _headers(self, host_only: bool = False) -> dict[str, str]:
-        """Headers for one request.
-
-        Host-only endpoints are gated by ``X-Host-Token``; when no token is
-        configured (single-host deployment) they must carry no profile header,
-        so the acting profile is passed in the body instead (``user_id``).
-        """
-
+    def _headers(self) -> dict[str, str]:
+        """Headers for one request."""
         headers: dict[str, str] = {}
-        if self._host_token:
-            headers[HOST_TOKEN_HEADER] = self._host_token
-        if self._profile_id and not host_only:
+        if self._profile_id:
             headers["X-Profile-Id"] = self._profile_id
         return headers
 
     # -- request helpers ---------------------------------------------------
 
-    def _client(self, timeout: float = _TIMEOUT_SECONDS, host_only: bool = False) -> httpx.Client:
-        return httpx.Client(
-            base_url=self._base_url, headers=self._headers(host_only), timeout=timeout
-        )
+    def _client(self, timeout: float = _TIMEOUT_SECONDS) -> httpx.Client:
+        return httpx.Client(base_url=self._base_url, headers=self._headers(), timeout=timeout)
 
-    def _request(self, method: str, path: str, *, host_only: bool = False, **kwargs: Any) -> Any:
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:
-            response = self._client(host_only=host_only).request(method, path, **kwargs)
+            response = self._client().request(method, path, **kwargs)
         except httpx.HTTPError as exc:
             raise ApiConnectionError(
                 f"Could not reach the TeamMeetingAI server at {self._base_url}. "
@@ -123,12 +110,12 @@ class TeamMeetingAIClient:
             return None
         return response.json()
 
-    def _download(self, path: str, target: Path, *, timeout: float, host_only: bool = False) -> int:
+    def _download(self, path: str, target: Path, *, timeout: float) -> int:
         """Stream a binary endpoint to ``target``; returns bytes written."""
 
         written = 0
         try:
-            with self._client(timeout=timeout, host_only=host_only) as client, client.stream(
+            with self._client(timeout=timeout) as client, client.stream(
                 "GET", path
             ) as response:
                 if response.status_code >= 400:
@@ -195,7 +182,7 @@ class TeamMeetingAIClient:
         return self._request("GET", f"/meetings/{meeting_id}")  # type: ignore[return-value]
 
     def delete_meeting(self, meeting_id: str) -> None:
-        self._request("DELETE", f"/meetings/{meeting_id}", host_only=True)
+        self._request("DELETE", f"/meetings/{meeting_id}")
 
     def upload_recording(
         self,
@@ -227,7 +214,7 @@ class TeamMeetingAIClient:
         try:
             files = {"file": (filename, handle, "audio/wav")}
             return self._request(
-                "POST", "/meetings", data=data, files=files, host_only=True,
+                "POST", "/meetings", data=data, files=files,
                 timeout=_UPLOAD_TIMEOUT_SECONDS,
             )  # type: ignore[return-value]
         finally:
@@ -250,7 +237,7 @@ class TeamMeetingAIClient:
         files = {"file": (path.name, open(path, "rb"), mime)}
         try:
             return self._request(
-                "POST", f"/meetings/{meeting_id}/files", files=files, host_only=True,
+                "POST", f"/meetings/{meeting_id}/files", files=files,
                 timeout=_UPLOAD_TIMEOUT_SECONDS,
             )  # type: ignore[return-value]
         finally:
@@ -263,7 +250,7 @@ class TeamMeetingAIClient:
                               timeout=_UPLOAD_TIMEOUT_SECONDS)
 
     def delete_attachment(self, file_id: str) -> None:
-        self._request("DELETE", f"/files/{file_id}", host_only=True)
+        self._request("DELETE", f"/files/{file_id}")
 
     # -- transcripts / summaries --------------------------------------------
 
@@ -289,7 +276,7 @@ class TeamMeetingAIClient:
 
     def patch_action_item(self, item_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         return self._request(
-            "PATCH", f"/action-items/{item_id}", json=fields, host_only=True
+            "PATCH", f"/action-items/{item_id}", json=fields
         )  # type: ignore[return-value]
 
     # -- speaker profiles -----------------------------------------------------
@@ -308,14 +295,14 @@ class TeamMeetingAIClient:
             "POST",
             f"/meetings/{meeting_id}/speakers/{local_label}/assign",
             json=fields,
-            host_only=True,
+            
         )  # type: ignore[return-value]
 
     def request_profiling(self, meeting_id: str) -> dict[str, Any]:
         """Host-only: (re-)queue the voice-profiling job; 409 when active."""
 
         return self._request(
-            "POST", f"/meetings/{meeting_id}/speakers/profile", host_only=True
+            "POST", f"/meetings/{meeting_id}/speakers/profile"
         )  # type: ignore[return-value]
 
     def list_speaker_profiles(self) -> list[dict[str, Any]]:
@@ -323,7 +310,7 @@ class TeamMeetingAIClient:
 
     def create_speaker_profile(self, display_name: str) -> dict[str, Any]:
         return self._request(
-            "POST", "/profiles", json={"display_name": display_name}, host_only=True
+            "POST", "/profiles", json={"display_name": display_name}
         )  # type: ignore[return-value]
 
     def rename_speaker_profile(self, profile_id: str, display_name: str) -> dict[str, Any]:
@@ -331,11 +318,11 @@ class TeamMeetingAIClient:
             "PATCH",
             f"/profiles/{profile_id}",
             json={"display_name": display_name},
-            host_only=True,
+            
         )  # type: ignore[return-value]
 
     def delete_speaker_profile(self, profile_id: str) -> None:
-        self._request("DELETE", f"/profiles/{profile_id}", host_only=True)
+        self._request("DELETE", f"/profiles/{profile_id}")
 
     # -- jobs ---------------------------------------------------------------
 
@@ -348,17 +335,17 @@ class TeamMeetingAIClient:
         """(Re-)queue transcription; 409 ``job_active`` when one is queued."""
 
         return self._request(
-            "POST", f"/meetings/{meeting_id}/transcribe", host_only=True
+            "POST", f"/meetings/{meeting_id}/transcribe"
         )  # type: ignore[return-value]
 
     def analyse(self, meeting_id: str) -> dict[str, Any]:
         return self._request(
-            "POST", f"/meetings/{meeting_id}/analyse", host_only=True
+            "POST", f"/meetings/{meeting_id}/analyse"
         )  # type: ignore[return-value]
 
     def cancel_job(self, meeting_id: str, job_id: str) -> dict[str, Any]:
         return self._request(
-            "POST", f"/meetings/{meeting_id}/jobs/{job_id}/cancel", host_only=True
+            "POST", f"/meetings/{meeting_id}/jobs/{job_id}/cancel"
         )  # type: ignore[return-value]
 
     def active_jobs(self, meeting_id: str) -> list[dict[str, Any]]:

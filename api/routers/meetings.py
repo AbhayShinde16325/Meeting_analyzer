@@ -12,11 +12,11 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, File, Form, Query, UploadFile
 from sqlalchemy import text
 
 from api import errors
-from api.deps import ConnDep, ProfileDep, require_host
+from api.deps import ConnDep, ProfileDep
 from api.schemas import MeetingOut
 from services.ingest import IngestError, ingest_recording, ingest_multi_source_recording, normalize_uploaded_audio
 
@@ -78,7 +78,6 @@ def list_meetings(
 @router.post("", response_model=MeetingOut, status_code=201)
 def create_meeting(
     profile: ProfileDep,
-    _: Annotated[None, Depends(require_host)],
     conn: ConnDep,
     title: Annotated[str, Form(min_length=1, max_length=300)],
     file: Annotated[UploadFile, File()],
@@ -88,7 +87,7 @@ def create_meeting(
     user_id: Annotated[uuid.UUID | None, Form()] = None,
     notes: Annotated[str | None, Form(max_length=4000)] = None,
 ) -> dict:
-    """Host-only: ingest a finished recording.
+    """Ingest a finished recording.
 
     Stores the original WAV and its 16 kHz mono derivative as Large Objects
     and queues a transcription job.  Note: audio is sent to Sarvam (cloud)
@@ -183,7 +182,6 @@ def get_meeting(meeting_id: uuid.UUID, conn: ConnDep) -> dict:
 @router.post("/multi-source", response_model=MeetingOut, status_code=201)
 def create_multi_source_meeting(
     profile: ProfileDep,
-    _: Annotated[None, Depends(require_host)],
     conn: ConnDep,
     title: Annotated[str, Form(min_length=1, max_length=300)],
     user_id: Annotated[uuid.UUID | None, Form()] = None,
@@ -195,7 +193,7 @@ def create_multi_source_meeting(
     browser: Annotated[UploadFile | None, File()] = None,
     mixed: Annotated[UploadFile | None, File()] = None,
 ) -> dict:
-    """Host-only: ingest synchronized multi-source recording."""
+    """Ingest synchronized multi-source recording."""
     effective_user = user_id or profile.get("id")
     if effective_user is None:
         raise errors.bad_request("user_required", "Select or create a profile before recording.")
@@ -252,12 +250,11 @@ def create_multi_source_meeting(
 
 @router.delete("/{meeting_id}", status_code=204)
 def delete_meeting(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     conn: ConnDep,
     profile: ProfileDep,
 ) -> None:
-    """Host-only, permanent deletion (no soft delete, no retention period)."""
+    """Permanent deletion (no soft delete, no retention period)."""
 
     result = conn.execute(
         text("DELETE FROM meetings WHERE id = :id"), {"id": meeting_id}

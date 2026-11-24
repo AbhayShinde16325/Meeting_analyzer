@@ -7,7 +7,7 @@
 - FastAPI API (`api/`) for meetings, files, transcripts, summaries, action items, jobs, speakers, metrics, search, and system status.
 - PostgreSQL persistence (`db/`) with Large Object audio storage and Alembic migrations.
 - Ingestion and background processing (`services/`, `ai/`) for transcription, analysis, profiling, metrics, and exports.
-- Host-only mutating operations gated by `X-Host-Token` (or single-host mode when no token is configured).
+- Recording/management operations are available after profile selection.
 
 ## Running
 
@@ -50,7 +50,6 @@ Services: PostgreSQL, FastAPI backend, React+Nginx frontend.
 See `.env.example` for server/provider variables. Key variables:
 
 - `DATABASE_URL` / `TEAMMEETINGAI_DATABASE_URL`
-- `TEAMMEETINGAI_HOST_TOKEN`
 - `TEAMMEETINGAI_SARVAM_API_KEY`
 - `TEAMMEETINGAI_ANALYSIS_BACKEND`, `TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS`, `TEAMMEETINGAI_GROQ_*`
 - `TEAMMEETINGAI_VOICE_PROFILING*`

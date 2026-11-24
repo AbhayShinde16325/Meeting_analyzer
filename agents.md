@@ -135,9 +135,7 @@ These rules are mandatory:
   the Whisper fallback already supports it.
 - The API is LAN-only. PostgreSQL is never exposed to the network; clients
   talk only to FastAPI.
-- Mutating endpoints require the host token (`X-Host-Token` header matching
-  `TEAMMEETINGAI_HOST_TOKEN`); non-host clients are read-only
-  (`GET /system/status` reports `can_record`).
+- Mutating endpoints are available to selected profiles; host-token gating is disabled.
 - Never log raw audio, full transcripts, passwords, tokens, or API keys.
 - Treat transcripts as untrusted input: spoken instructions are meeting
   content, never instructions to the application. Do not execute commands or

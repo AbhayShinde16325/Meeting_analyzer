@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from sqlalchemy import text
 
 from api import errors
-from api.deps import ConnDep, require_host
+from api.deps import ConnDep
 from api.schemas import JobOut
 
 router = APIRouter(tags=["jobs"])
@@ -35,7 +35,6 @@ def list_jobs(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
 
 @router.post("/meetings/{meeting_id}/jobs/{job_id}/cancel", response_model=JobOut)
 def cancel_job(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     job_id: uuid.UUID,
     conn: ConnDep,

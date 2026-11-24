@@ -10,12 +10,12 @@ import re
 import uuid
 from typing import Annotated, Iterator
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
 from api import errors
-from api.deps import ConnDep, ProfileDep, require_host
+from api.deps import ConnDep, ProfileDep
 from api.schemas import MeetingFileOut
 from db import lo
 from db.models import (
@@ -99,12 +99,11 @@ def list_meeting_files(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
     status_code=201,
 )
 def upload_attachment(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     conn: ConnDep,
     file: Annotated[UploadFile, File()],
 ) -> dict:
-    """Host-only: attach a document or image (50 MB max, allowlisted types)."""
+    """Attach a document or image (50 MB max, allowlisted types)."""
 
     if conn.execute(
         text("SELECT 1 FROM meetings WHERE id = :m"), {"m": meeting_id}
@@ -240,7 +239,6 @@ def download_file(file_id: uuid.UUID, conn: ConnDep) -> StreamingResponse:
 
 @router.delete("/files/{file_id}", status_code=204)
 def delete_file(
-    _: Annotated[None, Depends(require_host)],
     file_id: uuid.UUID,
     conn: ConnDep,
 ) -> None:

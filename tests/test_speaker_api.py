@@ -220,15 +220,10 @@ class TestProfileManagement:
         missing = speaker_api.delete(f"/profiles/{profile['id']}")
         assert missing.status_code == 404
 
-    def test_mutations_are_host_only(self, speaker_api):
+    def test_mutations_allowed_for_profiles(self, speaker_api):
         user = speaker_api.post("/users", json={"display_name": "Remote"}).json()
         headers = {"X-Profile-Id": user["id"]}
-        assert (
-            speaker_api.post(
-                "/profiles", json={"display_name": "X"}, headers=headers
-            ).status_code
-            == 403
-        )
+        assert speaker_api.post("/profiles", json={"display_name": "X"}, headers=headers).status_code == 201
 
     def test_empty_name_rejected(self, speaker_api):
         response = speaker_api.post("/profiles", json={"display_name": "   "})

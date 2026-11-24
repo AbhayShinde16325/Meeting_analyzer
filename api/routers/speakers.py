@@ -8,14 +8,13 @@ profile name only for confirmed assignments.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, File, UploadFile
 from pathlib import Path
 from sqlalchemy import text
 
 from api import errors
-from api.deps import ConnDep, ProfilerDep, require_host
+from api.deps import ConnDep, ProfilerDep
 from api.schemas import (
     JobOut,
     MeetingSpeakerOut,
@@ -62,14 +61,13 @@ def list_meeting_speakers(
     status_code=200,
 )
 def assign_meeting_speaker(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     local_label: str,
     payload: SpeakerAssignRequest,
     conn: ConnDep,
     profiler: ProfilerDep,
 ) -> dict:
-    """Host-only: confirm, reject, or reset a speaker label's profile match."""
+    """ confirm, reject, or reset a speaker label's profile match."""
 
     _meeting_exists(conn, meeting_id)
     if payload.profile_id is not None:
@@ -98,12 +96,11 @@ def assign_meeting_speaker(
 
 @router.post("/meetings/{meeting_id}/speakers/profile", response_model=JobOut, status_code=202)
 def request_profiling(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     conn: ConnDep,
     profiler: ProfilerDep,
 ) -> dict:
-    """Host-only: (re-)queue the voice-profiling job for this meeting."""
+    """ (re-)queue the voice-profiling job for this meeting."""
 
     _meeting_exists(conn, meeting_id)
     if not profiler.enabled:
@@ -155,7 +152,6 @@ def list_profiles(profiler: ProfilerDep) -> list[dict]:
 
 @profiles_router.post("", response_model=SpeakerProfileOut, status_code=201)
 def create_profile(
-    _: Annotated[None, Depends(require_host)],
     payload: SpeakerProfileCreate,
     profiler: ProfilerDep,
 ) -> dict:
@@ -168,7 +164,6 @@ def create_profile(
 
 @profiles_router.patch("/{profile_id}", response_model=SpeakerProfileOut)
 def rename_profile(
-    _: Annotated[None, Depends(require_host)],
     profile_id: uuid.UUID,
     payload: SpeakerProfileRename,
     profiler: ProfilerDep,
@@ -185,7 +180,6 @@ def rename_profile(
 
 @profiles_router.delete("/{profile_id}", status_code=204)
 def delete_profile(
-    _: Annotated[None, Depends(require_host)],
     profile_id: uuid.UUID,
     profiler: ProfilerDep,
 ) -> None:
@@ -197,12 +191,11 @@ def delete_profile(
 
 @profiles_router.post("/{profile_id}/enroll", response_model=dict)
 def enroll_profile(
-    _: Annotated[None, Depends(require_host)],
     profile_id: uuid.UUID,
     profiler: ProfilerDep,
     file: UploadFile = File(...),
 ) -> dict:
-    """Host-only: enroll a clean voice sample to a speaker profile."""
+    """ enroll a clean voice sample to a speaker profile."""
     import tempfile
     suffix = Path(file.filename or "enrollment.wav").suffix.lower() or ".wav"
     with tempfile.TemporaryDirectory(prefix="tma-enroll-") as td:

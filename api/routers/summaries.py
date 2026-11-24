@@ -7,13 +7,12 @@ transcript; the stored row records which transcript it was built from.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from sqlalchemy import text
 
 from api import errors
-from api.deps import ConnDep, require_host
+from api.deps import ConnDep
 from api.schemas import ActionItemOut, ActionItemPatch, JobOut, SummaryOut
 
 router = APIRouter(prefix="/meetings", tags=["summaries"])
@@ -38,11 +37,10 @@ def get_summary(meeting_id: uuid.UUID, conn: ConnDep) -> dict | None:
 
 @router.post("/{meeting_id}/analyse", response_model=JobOut, status_code=202)
 def analyse(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     conn: ConnDep,
 ) -> dict:
-    """Host-only: (re-)queue analysis of the primary transcript."""
+    """(Re-)queue analysis of the primary transcript."""
 
     if conn.execute(
         text("SELECT 1 FROM meetings WHERE id = :m"), {"m": meeting_id}
@@ -103,7 +101,6 @@ def list_action_items(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
 
 @action_router.patch("/{item_id}", response_model=ActionItemOut)
 def patch_action_item(
-    _: Annotated[None, Depends(require_host)],
     item_id: uuid.UUID,
     payload: ActionItemPatch,
     conn: ConnDep,

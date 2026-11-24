@@ -51,7 +51,7 @@ mono WAV as Large Objects and queues a transcription job — in one
 transaction. 5. The client deletes its temp capture directory only after the
 server accepted the upload.
 
-**Rules:** - Mutating endpoints require the host token (`X-Host-Token`); a
+**Rules:** - Mutating endpoints are available after profile selection;
 non-host client must get a clear read-only error. - Validate file type, size,
 and attachment constraints server-side; never trust client metadata. - Keep
 ingest atomic; a failed ingest must leave no orphan rows or Large Objects. -
@@ -177,7 +177,7 @@ server interaction through `client/src/api/client.js` — never touch the
 database/files/audio logic directly; use FastAPI endpoints. 3. Run uploads, polling, and
 downloads in worker threads; deliver results via Qt signals. 4. Poll job
 status while transcription/analysis runs; offer cancel. 5. Read
-`GET /system/status` (`can_record`) to enable or disable recording for
+`GET /system/status` to confirm backend health for
 read-only clients.
 
 **Rules:** - Do not block the UI with unhandled errors. -

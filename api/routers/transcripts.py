@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from sqlalchemy import text
 
 from api import errors
-from api.deps import ConnDep, require_host
+from api.deps import ConnDep
 from api.schemas import JobOut, TranscriptOut
 
 router = APIRouter(prefix="/meetings", tags=["transcripts"])
@@ -42,11 +41,10 @@ def list_transcripts(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
 
 @router.post("/{meeting_id}/transcribe", response_model=JobOut, status_code=202)
 def transcribe(
-    _: Annotated[None, Depends(require_host)],
     meeting_id: uuid.UUID,
     conn: ConnDep,
 ) -> dict:
-    """Host-only: (re-)queue transcription (Sarvam primary, Whisper fallback)."""
+    """(Re-)queue transcription (Sarvam primary, Whisper fallback)."""
 
     _meeting_exists(conn, meeting_id)
     original = conn.execute(

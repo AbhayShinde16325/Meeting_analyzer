@@ -127,7 +127,7 @@ class SystemStatus(BaseModel):
     db_size_bytes: int
     disk_free_bytes: int
     last_backup: dict[str, Any] | None = None
-    can_record: bool
+    can_record: bool = True
 
 
 class TranscriptMetricsOut(BaseModel):
