@@ -110,6 +110,7 @@ class JobOut(BaseModel):
     fallback_from: str | None = None
     fallback_reason: str | None = None
     created_at: datetime
+    started_at: datetime | None = None
     finished_at: datetime | None = None
 
 
@@ -151,7 +152,7 @@ class SpeakerCandidate(BaseModel):
 
 
 class MeetingSpeakerOut(BaseModel):
-    """One meeting-local diarized label with its review state."""
+    """One meeting-local diarized label with its review/matching state."""
 
     local_label: str
     segment_count: int
@@ -162,10 +163,21 @@ class MeetingSpeakerOut(BaseModel):
     profile_name: str | None = None
     confidence: float | None = None
     status: str | None = None
+    origin: str | None = None
     candidates: list[SpeakerCandidate] = Field(default_factory=list)
-    # Other labels in this meeting whose voice print is near-identical
-    # (diarization split one person into several labels).
+    # Other labels in this meeting whose voice print is near-identical.
     same_voice_labels: list[str] = Field(default_factory=list)
+    reference_available: bool = False
+    reference_count: int = 0
+    best_profile_id: uuid.UUID | None = None
+    best_profile_name: str | None = None
+    best_score: float | None = None
+    threshold: float | None = None
+    decision: str | None = None
+    profiles_evaluated: int | None = None
+    evaluated_at: datetime | None = None
+    job_status: str | None = None
+    job_error: str | None = None
 
 
 class SpeakerAssignRequest(BaseModel):
@@ -175,6 +187,16 @@ class SpeakerAssignRequest(BaseModel):
     # Create a brand-new profile with this name and confirm the label into it.
     new_profile_name: str | None = Field(default=None, min_length=1, max_length=120)
     status: str = Field(pattern="^(suggested|confirmed|rejected)$")
+
+
+class SpeakerReferenceOut(BaseModel):
+    id: uuid.UUID
+    profile_id: uuid.UUID
+    source_seconds: float | None = None
+    original_filename: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    created_at: datetime
 
 
 class SpeakerProfileOut(BaseModel):

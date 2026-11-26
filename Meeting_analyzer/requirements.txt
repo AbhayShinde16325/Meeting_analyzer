@@ -15,11 +15,10 @@ groq>=0.9,<2
 # to Sarvam's cloud service; the fallback stays local.
 sarvamai>=0.1.40,<0.2
 
-# OPTIONAL voice profiling (Voice Profiling V1, opt-in via
-# TEAMMEETINGAI_VOICE_PROFILING=1). Local GE2E speaker embeddings; pulls in
-# torch (large download). Everything else works without it.
-# resemblyzer>=0.1.4,<0.2
-# setuptools<81
+# Voice profiling (feature remains opt-in via TEAMMEETINGAI_VOICE_PROFILING=1).
+# Resemblyzer needs pkg_resources, removed by newer setuptools releases.
+resemblyzer>=0.1.4,<0.2
+setuptools<81
 
 # Loads KEY=VALUE secrets from a project-local .env file at startup.
 python-dotenv>=1.0,<2

@@ -1,18 +1,10 @@
-"""Voice speaker profiles: embeddings, matching, and user-reviewed identity.
+"""Voice speaker profiles: embeddings, matching, and review.
 
-Design rules:
-
-* Voice similarity **never** assigns an identity.  Automatic matching only
-  creates ``suggested`` assignments (or manual candidates below the suggest
-  threshold); a profile name is displayed in a transcript only after a user
-  confirmed the assignment.
-* Profile centroids grow exclusively from embeddings attached by confirmed
-  assignments, so corrections immediately improve future matching.
-* The encoder (Resemblyzer) is a lazy, optional dependency: without the
-  package the rest of the application works exactly as before.
-
-Embeddings are small fixed-length float vectors, stored as JSONB.  Meeting
-audio itself always stays in Large Objects (see ``db/models.py``).
+References are explicitly uploaded audio samples stored in
+``speaker_reference_embeddings``. Meeting-derived embeddings are diagnostics
+only and never become reference data. Clear, unambiguous matches above the
+configured threshold are automatically confirmed with ``origin='auto'``;
+manual confirmed/rejected decisions are preserved across re-profiling.
 """
 
 from __future__ import annotations
@@ -77,11 +69,7 @@ class MatchCandidate:
 
 
 class VoiceEncoderAdapter:
-    """Thin wrapper around the Resemblyzer GE2E encoder.
-
-    Kept behind an interface so tests (and future encoders) can substitute a
-    fake without touching the database or matching logic.
-    """
+    """Thin wrapper around the Resemblyzer GE2E encoder."""
 
     provider_name = "resemblyzer"
     model_name = "ge2e-256"
@@ -118,16 +106,17 @@ class VoiceEncoderAdapter:
             progress_cb=progress_cb,
         )
 
+    def embed_reference_audio(self, audio_path: Path) -> tuple[list[float], float]:
+        """Embed an explicit reference sample and return (embedding, seconds)."""
+
+        wav = self._preprocess_wav(str(audio_path))
+        sample_rate = 16_000
+        seconds = len(wav) / sample_rate if len(wav) else 0.0
+        return self._encoder.embed_utterance(wav).tolist(), seconds
+
 
 def encoder_import_error() -> str | None:
-    """Actionable message when the encoder cannot be imported, else None.
-
-    Actually imports ``resemblyzer`` (a ``find_spec`` check is not enough:
-    the package can be present while a broken dependency makes the import
-    fail, e.g. ``pkg_resources`` missing from setuptools >= 81).  A
-    successful import is cached by Python itself, so the torch import cost
-    is only paid once per process.
-    """
+    """Actionable message when the encoder cannot be imported, else None."""
 
     try:
         importlib.import_module("resemblyzer")
@@ -145,7 +134,7 @@ def encoder_import_error() -> str | None:
             return (
                 "Voice profiling is unavailable: the 'resemblyzer' package "
                 "is installed but cannot import 'pkg_resources'. Fix with: "
-                ".venv\\Scripts\\python.exe -m pip install \"setuptools<81\""
+                '.venv\\Scripts\\python.exe -m pip install "setuptools<81"'
             )
         return (
             "Voice profiling is unavailable: the 'resemblyzer' package is "
@@ -183,13 +172,13 @@ def embeddings_from_wav(
 ) -> list[LabelEmbedding]:
     """Group transcript segments by speaker label and embed each group.
 
-    ``embed_utterance`` maps one 16 kHz float slice to an embedding vector,
-    keeping this function testable without the real encoder.  Labels with
-    less than ``min_seconds`` of speech are skipped (too little speech for a
-    stable voice print).
+    Labels with no valid >=0.5s chunks, or with less than ``min_seconds`` of
+    total valid speech, are skipped. This prevents KeyError/unstable embeddings
+    from zero-length or short-only diarized labels.
     """
 
     sample_rate = 16_000
+    min_chunk_samples = int(0.5 * sample_rate)
     if len(wav) == 0:
         raise SpeakerProfilingError("The audio track is empty.")
 
@@ -200,9 +189,6 @@ def embeddings_from_wav(
         if not isinstance(label, str) or not label.strip():
             continue
         label = label.strip()
-        bucket = slices.setdefault(label, [])
-        if len(bucket) >= max_segments_per_speaker:
-            continue
         try:
             start = max(0.0, float(segment.get("start", 0.0) or 0.0))
             end = float(segment.get("end", start) or start)
@@ -210,8 +196,15 @@ def embeddings_from_wav(
             continue
         if end <= start:
             continue
-        chunk = wav[int(start * sample_rate) : int(end * sample_rate)]
-        if len(chunk) < int(0.5 * sample_rate):
+        start_i = int(start * sample_rate)
+        end_i = min(int(end * sample_rate), len(wav))
+        if end_i <= start_i:
+            continue
+        chunk = wav[start_i:end_i]
+        if len(chunk) < min_chunk_samples:
+            continue
+        bucket = slices.setdefault(label, [])
+        if len(bucket) >= max_segments_per_speaker:
             continue
         bucket.append(chunk)
         totals[label] = totals.get(label, 0.0) + (end - start)
@@ -219,14 +212,20 @@ def embeddings_from_wav(
     results: list[LabelEmbedding] = []
     labels = sorted(slices)
     for index, label in enumerate(labels):
-        if totals[label] < min_seconds:
+        bucket = slices.get(label, [])
+        if not bucket:
             continue
-        vectors = [embed_utterance(chunk) for chunk in slices[label]]
+        total = float(totals.get(label, 0.0))
+        if total < min_seconds:
+            continue
+        vectors = [embed_utterance(chunk) for chunk in bucket]
+        if not vectors:
+            continue
         results.append(
             LabelEmbedding(
                 local_label=label,
                 embedding=mean_embedding(vectors),
-                source_seconds=round(totals[label], 3),
+                source_seconds=round(total, 3),
             )
         )
         if progress_cb is not None:
@@ -255,58 +254,114 @@ class SpeakerProfileService:
             self._encoder = get_encoder()
         return self._encoder
 
-    def enroll_profile_audio(self, *, profile_id: str, audio_path: Path) -> dict[str, Any]:
-        """Enroll a user-provided voice sample into an existing profile.
+    @property
+    def enabled(self) -> bool:
+        return bool(self._settings.voice_profiling_enabled)
 
-        Uses the same encoder and stores an embedding as a confirmed profile
-        embedding (profile_id set). No diarization/meeting transcript is required.
+    # -- reference enrollment ------------------------------------------------
+
+    def enroll_profile_audio(
+        self,
+        *,
+        profile_id: str,
+        audio_path: Path,
+        original_filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Enroll an explicit reference sample into ``speaker_reference_embeddings``.
+
+        Never creates synthetic meetings, transcripts, or meeting embeddings.
         """
+
         if not self.enabled:
             raise SpeakerProfilingError(
                 "Voice profiling is disabled. Set TEAMMEETINGAI_VOICE_PROFILING=1 and install resemblyzer."
             )
         with self._engine.begin() as conn:
-            exists = conn.execute(text("SELECT id, display_name FROM meeting_analyzer.speaker_profiles WHERE id=:p"), {"p": profile_id}).mappings().one_or_none()
-            if exists is None:
+            profile = (
+                conn.execute(
+                    text(
+                        "SELECT id, display_name FROM meeting_analyzer.speaker_profiles WHERE id=:p"
+                    ),
+                    {"p": profile_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if profile is None:
                 raise SpeakerProfilingError("Speaker profile not found.")
         encoder = self._get_encoder()
-        # Reuse preprocess/embed from encoder; require enough speech.
-        from resemblyzer import preprocess_wav
-        wav = preprocess_wav(str(audio_path))
-        sample_rate = 16000
-        seconds = len(wav) / sample_rate if len(wav) else 0.0
+        embedding, seconds = encoder.embed_reference_audio(audio_path)
         if seconds < self._settings.voice_min_segment_seconds:
             raise SpeakerProfilingError(
-                f"Enrollment sample too short ({seconds:.1f}s). Provide at least {self._settings.voice_min_segment_seconds:.0f}s of clean speech."
+                f"Enrollment sample too short ({seconds:.1f}s). Provide at least "
+                f"{self._settings.voice_min_segment_seconds:.0f}s of clean speech."
             )
-        # Quality guard: avoid near-silent samples.
-        if float(np.sqrt(np.mean(np.square(wav)))) < 0.01:
-            raise SpeakerProfilingError("Enrollment sample appears too quiet/noisy. Please record a clearer sample.")
-        embedding = encoder._encoder.embed_utterance(wav).tolist()
+        if float(np.linalg.norm(np.asarray(embedding, dtype=np.float64))) <= 1e-8:
+            raise SpeakerProfilingError(
+                "Enrollment sample appears too quiet/noisy. Please record a clearer sample."
+            )
         with self._engine.begin() as conn:
-            # Store as a synthetic enrollment embedding. meeting_id/transcript_id/local_label are required by schema;
-            # we create a hidden enrollment transcript/meeting-less linkage is not possible, so attach to a synthetic
-            # enrollment meeting owned by no user? Instead, create enrollment rows in a lightweight way by using a
-            # dedicated enrollment meeting/transcript per profile sample.
-            user_id = conn.execute(text("SELECT id FROM meeting_analyzer.users ORDER BY created_at LIMIT 1")).scalar_one_or_none()
-            if user_id is None:
-                raise SpeakerProfilingError("Create a user/profile before enrolling speaker voice samples.")
-            meeting_id = conn.execute(text(
-                "INSERT INTO meeting_analyzer.meetings (id, user_id, title, status) VALUES (gen_random_uuid(), :u, :t, 'completed') RETURNING id"
-            ), {"u": user_id, "t": f"Voice enrollment: {exists['display_name']}"}).scalar_one()
-            transcript_id = conn.execute(text(
-                "INSERT INTO meeting_analyzer.transcripts (id, meeting_id, provider, model, is_primary, text, segments) "
-                "VALUES (gen_random_uuid(), :m, 'enrollment', 'resemblyzer-ge2e', false, :txt, CAST(:seg AS jsonb)) RETURNING id"
-            ), {"m": meeting_id, "txt": "Voice enrollment sample", "seg": _json([{"start":0.0,"end":round(seconds,3),"text":"enrollment","speaker":"Enrollment"}])}).scalar_one()
-            conn.execute(text(
-                "INSERT INTO meeting_analyzer.speaker_embeddings (id, meeting_id, transcript_id, local_label, embedding, source_seconds, profile_id) "
-                "VALUES (gen_random_uuid(), :m, :t, 'Enrollment', CAST(:e AS jsonb), :s, :p)"
-            ), {"m": meeting_id, "t": transcript_id, "e": _json(embedding), "s": float(seconds), "p": profile_id})
-        return {"profile_id": profile_id, "display_name": exists["display_name"], "seconds": round(seconds,3), "embedding_count": self.profile_embedding_count(profile_id)}
+            row = (
+                conn.execute(
+                    text(
+                        "INSERT INTO meeting_analyzer.speaker_reference_embeddings "
+                        "(id, profile_id, embedding, source_seconds, original_filename, provider, model) "
+                        "VALUES (gen_random_uuid(), :p, CAST(:e AS jsonb), :s, :fn, :provider, :model) "
+                        "RETURNING id, profile_id, source_seconds, original_filename, provider, model, created_at"
+                    ),
+                    {
+                        "p": profile_id,
+                        "e": _json(embedding),
+                        "s": float(seconds),
+                        "fn": original_filename,
+                        "provider": encoder.provider_name,
+                        "model": encoder.model_name,
+                    },
+                )
+                .mappings()
+                .one()
+            )
+        return {
+            "profile_id": str(profile["id"]),
+            "display_name": str(profile["display_name"]),
+            "seconds": round(float(seconds), 3),
+            "embedding_count": self.profile_embedding_count(profile_id),
+            "reference": dict(row),
+        }
 
-    @property
-    def enabled(self) -> bool:
-        return bool(self._settings.voice_profiling_enabled)
+    def list_profile_references(self, profile_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM meeting_analyzer.speaker_profiles WHERE id=:p"),
+                {"p": profile_id},
+            ).scalar_one_or_none()
+            if exists is None:
+                raise SpeakerProfilingError("Speaker profile not found.")
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT id, profile_id, source_seconds, original_filename, provider, model, created_at "
+                        "FROM meeting_analyzer.speaker_reference_embeddings WHERE profile_id=:p "
+                        "ORDER BY created_at DESC, id DESC"
+                    ),
+                    {"p": profile_id},
+                )
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]
+
+    def delete_profile_reference(self, profile_id: str, reference_id: str) -> None:
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "DELETE FROM meeting_analyzer.speaker_reference_embeddings "
+                    "WHERE id=:r AND profile_id=:p"
+                ),
+                {"r": reference_id, "p": profile_id},
+            )
+        if result.rowcount == 0:
+            raise SpeakerProfilingError("Reference sample not found.")
 
     # -- compute + match (pipeline) -----------------------------------------
 
@@ -319,11 +374,10 @@ class SpeakerProfileService:
         segments: list[dict[str, Any]],
         progress_cb: ProgressCallback | None = None,
     ) -> list[LabelEmbedding]:
-        """Compute per-label embeddings, store them, and record suggestions.
+        """Compute per-label embeddings, persist diagnostics, and apply matches.
 
-        Suggestions are written only where no user decision exists yet:
-        confirmed/rejected assignments are never overwritten.  Returns the
-        embeddings that were stored.
+        Confirmed/rejected manual assignments are never overwritten. Auto/suggested
+        rows are recomputed; obsolete auto/suggested rows are removed.
         """
 
         label_embeddings = self._get_encoder().compute_label_embeddings(
@@ -333,71 +387,166 @@ class SpeakerProfileService:
             max_segments_per_speaker=self._settings.voice_max_segments_per_speaker,
             progress_cb=progress_cb,
         )
-        if not label_embeddings:
+        label_embeddings = [
+            item
+            for item in label_embeddings
+            if item.source_seconds >= self._settings.voice_min_segment_seconds
+            and float(np.linalg.norm(np.asarray(item.embedding, dtype=np.float64)))
+            > 1e-8
+        ]
+        with self._engine.connect() as conn:
+            diarized_labels = _diarized_labels(conn, transcript_id)
+
+        if not label_embeddings and not diarized_labels:
             return []
 
         centroids = self._profile_centroids()
+        profile_count = len(centroids)
+        threshold = float(self._settings.voice_match_threshold)
+        ambiguity_margin = float(self._settings.voice_match_ambiguity_margin)
+        eval_time = _now_sql(self._engine)
+
+        embedded_by_label = {item.local_label: item for item in label_embeddings}
         with self._engine.begin() as conn:
-            # Re-profiling the same transcript replaces its embeddings, but
-            # user decisions in speaker_assignments always survive.
-            conn.execute(
-                text("DELETE FROM meeting_analyzer.speaker_embeddings WHERE transcript_id = :t"),
-                {"t": transcript_id},
-            )
-            for item in label_embeddings:
+            for label in sorted(diarized_labels):
+                item = embedded_by_label.get(label)
+                assignment = (
+                    conn.execute(
+                        text(
+                            "SELECT profile_id, status, origin FROM meeting_analyzer.speaker_assignments "
+                            "WHERE transcript_id=:t AND local_label=:label"
+                        ),
+                        {"t": transcript_id, "label": label},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                manual_locked = bool(
+                    assignment
+                    and assignment["status"] in ("confirmed", "rejected")
+                    and assignment.get("origin", "manual") == "manual"
+                )
+
+                if item is None:
+                    if not manual_locked:
+                        conn.execute(
+                            text(
+                                "DELETE FROM meeting_analyzer.speaker_assignments "
+                                "WHERE transcript_id=:t AND local_label=:label "
+                                "AND (origin='auto' OR status='suggested') "
+                                "AND NOT (origin='manual' AND status IN ('confirmed','rejected'))"
+                            ),
+                            {"t": transcript_id, "label": label},
+                        )
+                    continue
+
+                ranked = self._rank_profiles(item.embedding, centroids)
+                best = ranked[0] if ranked else None
+                second = ranked[1] if len(ranked) > 1 else None
+                best_score = float(best.confidence) if best else None
+                best_profile_id = str(best.profile_id) if best else None
+                decision = self._decision(best_score, second.confidence if second else None, profile_count, threshold, ambiguity_margin)
+                match_profile_id = best_profile_id if decision == "matched" else None
+
+                # Preserve profile link for manually locked confirmed assignments.
+                profile_link = (
+                    str(assignment["profile_id"])
+                    if manual_locked
+                    and assignment["status"] == "confirmed"
+                    and assignment["profile_id"] is not None
+                    else match_profile_id
+                )
                 conn.execute(
                     text(
-                        "INSERT INTO meeting_analyzer.speaker_embeddings (id, meeting_id, "
-                        "transcript_id, local_label, embedding, source_seconds) "
-                        "VALUES (gen_random_uuid(), :m, :t, :label, "
-                        "CAST(:embedding AS jsonb), :seconds)"
+                        "INSERT INTO meeting_analyzer.speaker_embeddings "
+                        "(id, meeting_id, transcript_id, local_label, embedding, source_seconds, profile_id, "
+                        " best_profile_id, best_score, decision, profiles_evaluated, match_threshold, evaluated_at) "
+                        "VALUES (gen_random_uuid(), :m, :t, :label, CAST(:embedding AS jsonb), :seconds, :profile, "
+                        " :best_profile, :best_score, :decision, :profiles_evaluated, :match_threshold, :evaluated_at) "
+                        "ON CONFLICT (transcript_id, local_label) DO UPDATE SET "
+                        "embedding=EXCLUDED.embedding, source_seconds=EXCLUDED.source_seconds, profile_id=EXCLUDED.profile_id, "
+                        "best_profile_id=EXCLUDED.best_profile_id, best_score=EXCLUDED.best_score, decision=EXCLUDED.decision, "
+                        "profiles_evaluated=EXCLUDED.profiles_evaluated, match_threshold=EXCLUDED.match_threshold, evaluated_at=EXCLUDED.evaluated_at"
                     ),
                     {
                         "m": meeting_id,
                         "t": transcript_id,
-                        "label": item.local_label,
+                        "label": label,
                         "embedding": _json(item.embedding),
                         "seconds": item.source_seconds,
+                        "profile": profile_link,
+                        "best_profile": best_profile_id,
+                        "best_score": best_score,
+                        "decision": decision,
+                        "profiles_evaluated": profile_count,
+                        "match_threshold": threshold,
+                        "evaluated_at": eval_time,
                     },
                 )
-                candidates = self._match(
-                    item.embedding, centroids, self._settings.voice_review_threshold
-                )
-                best = candidates[0] if candidates else None
-                if best is None or best.confidence < self._settings.voice_match_threshold:
-                    # No automatic suggestion; the candidate (if any) stays
-                    # available for manual assignment in the review UI.
+
+                if manual_locked:
                     continue
-                conn.execute(
-                    text(
-                        "INSERT INTO meeting_analyzer.speaker_assignments (id, meeting_id, "
-                        "transcript_id, local_label, profile_id, confidence, status) "
-                        "VALUES (gen_random_uuid(), :m, :t, :label, :profile, "
-                        ":confidence, 'suggested') "
-                        "ON CONFLICT (transcript_id, local_label) DO UPDATE SET "
-                        "profile_id = EXCLUDED.profile_id, "
-                        "confidence = EXCLUDED.confidence, status = 'suggested', "
-                        "updated_at = now() "
-                        "WHERE speaker_assignments.status = 'suggested'"
-                    ),
-                    {
-                        "m": meeting_id,
-                        "t": transcript_id,
-                        "label": item.local_label,
-                        "profile": best.profile_id,
-                        "confidence": round(best.confidence, 4),
-                    },
-                )
+
+                if decision == "matched" and best is not None:
+                    conn.execute(
+                        text(
+                            "INSERT INTO meeting_analyzer.speaker_assignments "
+                            "(id, meeting_id, transcript_id, local_label, profile_id, confidence, status, origin) "
+                            "VALUES (gen_random_uuid(), :m, :t, :label, :profile, :confidence, 'confirmed', 'auto') "
+                            "ON CONFLICT (transcript_id, local_label) DO UPDATE SET "
+                            "profile_id=EXCLUDED.profile_id, confidence=EXCLUDED.confidence, status='confirmed', origin='auto', updated_at=now() "
+                            "WHERE NOT (speaker_assignments.origin='manual' AND speaker_assignments.status IN ('confirmed','rejected'))"
+                        ),
+                        {
+                            "m": meeting_id,
+                            "t": transcript_id,
+                            "label": label,
+                            "profile": str(best.profile_id),
+                            "confidence": round(float(best.confidence), 4),
+                        },
+                    )
+                else:
+                    conn.execute(
+                        text(
+                            "DELETE FROM meeting_analyzer.speaker_assignments "
+                            "WHERE transcript_id=:t AND local_label=:label "
+                            "AND (origin='auto' OR status='suggested') "
+                            "AND NOT (origin='manual' AND status IN ('confirmed','rejected'))"
+                        ),
+                        {"t": transcript_id, "label": label},
+                    )
         return label_embeddings
 
+    @staticmethod
+    def _decision(
+        best_score: float | None,
+        second_score: float | None,
+        profile_count: int,
+        threshold: float,
+        ambiguity_margin: float,
+    ) -> str:
+        if profile_count <= 0:
+            return "no_reference"
+        if best_score is None:
+            return "below_threshold"
+        if best_score < threshold:
+            return "below_threshold"
+        # best_score >= threshold
+        if (
+            second_score is not None
+            and second_score >= threshold
+            and round(best_score - second_score, 10) < ambiguity_margin
+        ):
+            return "ambiguous"
+        return "matched"
+
     def _profile_centroids(self) -> dict[str, list[float]]:
-        """Mean embedding per profile from user-confirmed embeddings only."""
+        """Mean explicit reference embeddings per profile. References only."""
 
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT profile_id, embedding FROM meeting_analyzer.speaker_embeddings "
-                    "WHERE profile_id IS NOT NULL"
+                    "SELECT profile_id, embedding FROM meeting_analyzer.speaker_reference_embeddings"
                 )
             ).all()
         grouped: dict[str, list[list[float]]] = {}
@@ -410,6 +559,23 @@ class SpeakerProfileService:
             for profile_id, vectors in grouped.items()
         }
 
+    def _rank_profiles(
+        self, embedding: list[float], centroids: dict[str, list[float]]
+    ) -> list[MatchCandidate]:
+        if not centroids:
+            return []
+        names = self._profile_names(list(centroids))
+        candidates = [
+            MatchCandidate(
+                profile_id=pid,
+                profile_name=names.get(pid, ""),
+                confidence=cosine_similarity(embedding, centroid),
+            )
+            for pid, centroid in centroids.items()
+        ]
+        candidates.sort(key=lambda c: c.confidence, reverse=True)
+        return candidates
+
     def _match(
         self,
         embedding: list[float],
@@ -418,22 +584,7 @@ class SpeakerProfileService:
     ) -> list[MatchCandidate]:
         """Rank profiles by cosine similarity above ``min_confidence``."""
 
-        if not centroids:
-            return []
-        names = self._profile_names(list(centroids))
-        candidates: list[MatchCandidate] = []
-        for profile_id, centroid in centroids.items():
-            score = cosine_similarity(embedding, centroid)
-            if score >= min_confidence:
-                candidates.append(
-                    MatchCandidate(
-                        profile_id=profile_id,
-                        profile_name=names.get(profile_id, ""),
-                        confidence=score,
-                    )
-                )
-        candidates.sort(key=lambda candidate: candidate.confidence, reverse=True)
-        return candidates
+        return [c for c in self._rank_profiles(embedding, centroids) if c.confidence >= min_confidence]
 
     def _profile_names(self, profile_ids: list[str]) -> dict[str, str]:
         if not profile_ids:
@@ -451,20 +602,20 @@ class SpeakerProfileService:
     # -- review (API) --------------------------------------------------------
 
     def list_meeting_speakers(self, meeting_id: str) -> list[dict[str, Any]]:
-        """Every diarized label in the meeting's primary transcript.
-
-        Includes the stored embedding state, the current assignment (if any)
-        and manual candidate profiles above the review threshold.
-        """
+        """Diarized labels with persisted diagnostics and review state."""
 
         with self._engine.begin() as conn:
-            transcript = conn.execute(
-                text(
-                    "SELECT id, segments FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
-                    "AND is_primary = true"
-                ),
-                {"m": meeting_id},
-            ).mappings().one_or_none()
+            transcript = (
+                conn.execute(
+                    text(
+                        "SELECT id, segments FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
+                        "AND is_primary = true"
+                    ),
+                    {"m": meeting_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if transcript is None:
                 return []
 
@@ -474,7 +625,9 @@ class SpeakerProfileService:
                 if not isinstance(label, str) or not label.strip():
                     continue
                 label = label.strip()
-                entry = labels.setdefault(label, {"segment_count": 0, "speech_seconds": 0.0})
+                entry = labels.setdefault(
+                    label, {"segment_count": 0, "speech_seconds": 0.0}
+                )
                 entry["segment_count"] += 1
                 try:
                     start = float(segment.get("start", 0.0) or 0.0)
@@ -488,31 +641,46 @@ class SpeakerProfileService:
                 str(row["local_label"]): row
                 for row in conn.execute(
                     text(
-                        "SELECT id, local_label, embedding, source_seconds, profile_id "
+                        "SELECT id, local_label, embedding, source_seconds, profile_id, "
+                        "best_profile_id, best_score, decision, profiles_evaluated, match_threshold, evaluated_at "
                         "FROM meeting_analyzer.speaker_embeddings WHERE transcript_id = :t"
                     ),
                     {"t": transcript["id"]},
-                ).mappings()
+                )
+                .mappings()
             }
             assignments = {
                 str(row["local_label"]): row
                 for row in conn.execute(
                     text(
-                        "SELECT id, local_label, profile_id, confidence, status "
+                        "SELECT id, local_label, profile_id, confidence, status, origin "
                         "FROM meeting_analyzer.speaker_assignments WHERE transcript_id = :t"
                     ),
                     {"t": transcript["id"]},
-                ).mappings()
+                )
+                .mappings()
             }
+            latest_job = (
+                conn.execute(
+                    text(
+                        "SELECT status, error, started_at, finished_at "
+                        "FROM meeting_analyzer.processing_jobs "
+                        "WHERE meeting_id=:m AND job_type='profiling' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"m": meeting_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
 
         profiles = self.list_profiles()
         profile_names = {str(p["id"]): str(p["display_name"]) for p in profiles}
+        profile_ref_counts = {str(p["id"]): int(p.get("embedding_count") or 0) for p in profiles}
+        reference_available = sum(profile_ref_counts.values()) > 0
         centroids = self._profile_centroids()
+        threshold = float(self._settings.voice_match_threshold)
 
-        # Same-voice detection: two auto-detected labels whose voice prints
-        # are near-identical are the same person split by diarization.  This
-        # is a *suggestion* only — merging happens when the user assigns
-        # both labels to the same profile.
         same_voice = self._same_voice_map(
             {
                 label: list(row["embedding"])
@@ -521,24 +689,25 @@ class SpeakerProfileService:
             }
         )
 
+        job_status = str(latest_job["status"]) if latest_job else None
+        job_error = str(latest_job["error"]) if latest_job and latest_job["error"] else None
+
         speakers: list[dict[str, Any]] = []
         for label in sorted(labels):
             stats = labels[label]
-            embedding = embeddings.get(label)
+            emb = embeddings.get(label)
             assignment = assignments.get(label)
-            embedding_vector = (
-                list(embedding["embedding"]) if embedding is not None else None
-            )
+            embedding_vector = list(emb["embedding"]) if emb is not None else None
             candidates: list[dict[str, Any]] = []
             if embedding_vector is not None:
-                for candidate in self._match(
+                for cand in self._match(
                     embedding_vector, centroids, self._settings.voice_review_threshold
                 ):
                     candidates.append(
                         {
-                            "profile_id": candidate.profile_id,
-                            "display_name": candidate.profile_name,
-                            "confidence": round(candidate.confidence, 4),
+                            "profile_id": cand.profile_id,
+                            "display_name": cand.profile_name,
+                            "confidence": round(cand.confidence, 4),
                         }
                     )
             profile_id = (
@@ -546,6 +715,23 @@ class SpeakerProfileService:
                 if assignment is not None and assignment["profile_id"] is not None
                 else None
             )
+            best_profile_id = (
+                str(emb["best_profile_id"])
+                if emb is not None and emb.get("best_profile_id") is not None
+                else (candidates[0]["profile_id"] if candidates else None)
+            )
+            best_score = (
+                float(emb["best_score"])
+                if emb is not None and emb.get("best_score") is not None
+                else (float(candidates[0]["confidence"]) if candidates else None)
+            )
+            decision = str(emb["decision"]) if emb is not None and emb.get("decision") else None
+            if decision is None:
+                if emb is None:
+                    decision = "error" if job_status == "failed" else "no_embedding"
+                elif not reference_available:
+                    decision = "no_reference"
+
             speakers.append(
                 {
                     "local_label": label,
@@ -553,26 +739,40 @@ class SpeakerProfileService:
                     "speech_seconds": round(stats["speech_seconds"], 2),
                     "has_embedding": embedding_vector is not None,
                     "embedded_profile_id": (
-                        str(embedding["profile_id"])
-                        if embedding is not None and embedding["profile_id"] is not None
+                        str(emb["profile_id"])
+                        if emb is not None and emb["profile_id"] is not None
                         else None
                     ),
                     "profile_id": profile_id,
-                    "profile_name": (
-                        profile_names.get(profile_id, "") if profile_id else None
-                    ),
+                    "profile_name": profile_names.get(profile_id) if profile_id else None,
                     "confidence": (
                         round(float(assignment["confidence"]), 4)
                         if assignment is not None and assignment["confidence"] is not None
-                        else None
+                        else (round(best_score, 4) if best_score is not None else None)
                     ),
-                    "status": (
-                        str(assignment["status"])
-                        if assignment is not None
-                        else None
-                    ),
+                    "status": str(assignment["status"]) if assignment is not None else None,
+                    "origin": str(assignment["origin"]) if assignment is not None and assignment.get("origin") else None,
                     "candidates": candidates,
                     "same_voice_labels": same_voice.get(label, []),
+                    "reference_available": reference_available,
+                    "reference_count": sum(profile_ref_counts.values()),
+                    "best_profile_id": best_profile_id,
+                    "best_profile_name": profile_names.get(best_profile_id) if best_profile_id else None,
+                    "best_score": round(best_score, 4) if best_score is not None else None,
+                    "threshold": (
+                        round(float(emb["match_threshold"]), 4)
+                        if emb is not None and emb.get("match_threshold") is not None
+                        else None
+                    ),
+                    "decision": decision,
+                    "profiles_evaluated": (
+                        int(emb["profiles_evaluated"])
+                        if emb is not None and emb.get("profiles_evaluated") is not None
+                        else (len(centroids) if emb is not None else None)
+                    ),
+                    "evaluated_at": emb.get("evaluated_at") if emb is not None else None,
+                    "job_status": job_status,
+                    "job_error": job_error,
                 }
             )
         return speakers
@@ -580,12 +780,6 @@ class SpeakerProfileService:
     def _same_voice_map(
         self, label_embeddings: dict[str, list[float]]
     ) -> dict[str, list[str]]:
-        """Pair labels whose voice prints are near-identical.
-
-        Returns, per label, the other labels whose embeddings score at or
-        above ``voice_merge_threshold``, best match first.
-        """
-
         threshold = self._settings.voice_merge_threshold
         labels = sorted(label_embeddings)
         same_voice: dict[str, list[tuple[float, str]]] = {}
@@ -611,14 +805,7 @@ class SpeakerProfileService:
         new_profile_name: str | None,
         status: str,
     ) -> dict[str, Any]:
-        """Create or update a user decision for one meeting-local label.
-
-        ``status`` is ``confirmed`` (attach to a profile, existing or newly
-        created), ``rejected`` (this label is nobody we track), or
-        ``suggested`` (undo back to the model's suggestion).  Confirming
-        attaches the meeting's embedding to the profile so future matching
-        learns from the correction.
-        """
+        """Create or update a manual decision for one meeting-local label."""
 
         if status not in ("suggested", "confirmed", "rejected"):
             raise SpeakerProfilingError(f"Invalid assignment status {status!r}.")
@@ -627,28 +814,46 @@ class SpeakerProfileService:
                 "Confirming a speaker requires a profile or a new profile name."
             )
 
-        # Keep any model confidence already recorded on the assignment; the
-        # user's explicit decision supersedes it either way.
-        confidence: float | None = None
-
         with self._engine.begin() as conn:
-            transcript = conn.execute(
-                text(
-                    "SELECT id FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
-                    "AND is_primary = true"
-                ),
-                {"m": meeting_id},
-            ).mappings().one_or_none()
+            transcript = (
+                conn.execute(
+                    text(
+                        "SELECT id FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
+                        "AND is_primary = true"
+                    ),
+                    {"m": meeting_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if transcript is None:
                 raise SpeakerProfilingError(
                     "This meeting has no primary transcript yet."
                 )
             transcript_id = str(transcript["id"])
+            label_exists = conn.execute(
+                text(
+                    "SELECT 1 FROM meeting_analyzer.transcripts t "
+                    "CROSS JOIN LATERAL jsonb_array_elements(t.segments) segment "
+                    "WHERE t.id=:t AND segment->>'speaker'=:label LIMIT 1"
+                ),
+                {"t": transcript_id, "label": local_label},
+            ).scalar_one_or_none()
+            if label_exists is None:
+                raise SpeakerProfilingError(
+                    "Speaker label not found in the primary transcript."
+                )
 
             if status == "confirmed":
                 if new_profile_name:
                     profile_id = self.create_profile(new_profile_name)["id"]
                 assert profile_id is not None
+                exists = conn.execute(
+                    text("SELECT 1 FROM meeting_analyzer.speaker_profiles WHERE id=:p"),
+                    {"p": profile_id},
+                ).scalar_one_or_none()
+                if not exists:
+                    raise SpeakerProfilingError("Speaker profile not found.")
                 conn.execute(
                     text(
                         "UPDATE meeting_analyzer.speaker_embeddings SET profile_id = :p "
@@ -656,46 +861,57 @@ class SpeakerProfileService:
                     ),
                     {"p": profile_id, "t": transcript_id, "label": local_label},
                 )
+            else:
+                conn.execute(
+                    text(
+                        "UPDATE meeting_analyzer.speaker_embeddings SET profile_id = NULL "
+                        "WHERE transcript_id = :t AND local_label = :label"
+                    ),
+                    {"t": transcript_id, "label": local_label},
+                )
 
-            row = conn.execute(
-                text(
-                    "INSERT INTO meeting_analyzer.speaker_assignments (id, meeting_id, transcript_id, "
-                    "local_label, profile_id, confidence, status) "
-                    "VALUES (gen_random_uuid(), :m, :t, :label, :profile, "
-                    "CAST(:confidence AS double precision), :status) "
-                    "ON CONFLICT (transcript_id, local_label) DO UPDATE SET "
-                    "profile_id = EXCLUDED.profile_id, status = EXCLUDED.status, "
-                    "confidence = COALESCE("
-                    "CAST(:confidence AS double precision), "
-                    "speaker_assignments.confidence), "
-                    "updated_at = now() "
-                    "RETURNING id, profile_id, status, confidence"
-                ),
-                {
-                    "m": meeting_id,
-                    "t": transcript_id,
-                    "label": local_label,
-                    "profile": profile_id,
-                    "confidence": confidence,
-                    "status": status,
-                },
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "INSERT INTO meeting_analyzer.speaker_assignments (id, meeting_id, transcript_id, "
+                        "local_label, profile_id, confidence, status, origin) "
+                        "VALUES (gen_random_uuid(), :m, :t, :label, :profile, NULL, :status, 'manual') "
+                        "ON CONFLICT (transcript_id, local_label) DO UPDATE SET "
+                        "profile_id = EXCLUDED.profile_id, status = EXCLUDED.status, origin = 'manual', "
+                        "updated_at = now() "
+                        "RETURNING id, profile_id, status, confidence, origin"
+                    ),
+                    {
+                        "m": meeting_id,
+                        "t": transcript_id,
+                        "label": local_label,
+                        "profile": profile_id,
+                        "status": status,
+                    },
+                )
+                .mappings()
+                .one()
+            )
             return dict(row)
 
     # -- profile management ---------------------------------------------------
 
     def list_profiles(self) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT p.id, p.display_name, p.created_at, "
-                    "COUNT(e.id) AS embedding_count "
-                    "FROM meeting_analyzer.speaker_profiles p "
-                    "LEFT JOIN meeting_analyzer.speaker_embeddings e ON e.profile_id = p.id "
-                    "GROUP BY p.id, p.display_name, p.created_at "
-                    "ORDER BY p.display_name"
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT p.id, p.display_name, p.created_at, p.updated_at, "
+                        "COUNT(r.id) AS embedding_count "
+                        "FROM meeting_analyzer.speaker_profiles p "
+                        "LEFT JOIN meeting_analyzer.speaker_reference_embeddings r ON r.profile_id = p.id "
+                        "GROUP BY p.id, p.display_name, p.created_at, p.updated_at "
+                        "ORDER BY p.display_name"
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
         return [dict(row) for row in rows]
 
     def create_profile(self, display_name: str) -> dict[str, Any]:
@@ -711,14 +927,18 @@ class SpeakerProfileService:
                 raise SpeakerProfilingError(
                     f"A speaker profile named '{name}' already exists."
                 )
-            row = conn.execute(
-                text(
-                    "INSERT INTO meeting_analyzer.speaker_profiles (id, display_name) "
-                    "VALUES (gen_random_uuid(), :n) "
-                    "RETURNING id, display_name, created_at"
-                ),
-                {"n": name},
-            ).mappings().one()
+            row = (
+                conn.execute(
+                    text(
+                        "INSERT INTO meeting_analyzer.speaker_profiles (id, display_name) "
+                        "VALUES (gen_random_uuid(), :n) "
+                        "RETURNING id, display_name, created_at, updated_at"
+                    ),
+                    {"n": name},
+                )
+                .mappings()
+                .one()
+            )
         return dict(row)
 
     def rename_profile(self, profile_id: str, display_name: str) -> dict[str, Any]:
@@ -737,26 +957,30 @@ class SpeakerProfileService:
                 raise SpeakerProfilingError(
                     f"A speaker profile named '{name}' already exists."
                 )
-            row = conn.execute(
-                text(
-                    "UPDATE meeting_analyzer.speaker_profiles SET display_name = :n, updated_at = now() "
-                    "WHERE id = :p "
-                    "RETURNING id, display_name, created_at, updated_at"
-                ),
-                {"n": name, "p": profile_id},
-            ).mappings().one_or_none()
+            row = (
+                conn.execute(
+                    text(
+                        "UPDATE meeting_analyzer.speaker_profiles SET display_name = :n, updated_at = now() "
+                        "WHERE id = :p "
+                        "RETURNING id, display_name, created_at, updated_at"
+                    ),
+                    {"n": name, "p": profile_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
         if row is None:
             raise SpeakerProfilingError("Speaker profile not found.")
         return dict(row)
 
     def profile_embedding_count(self, profile_id: str) -> int:
-        """How many confirmed embeddings back a profile (V1 review signal)."""
+        """Number of explicit reference samples for a profile."""
 
         with self._engine.connect() as conn:
             return int(
                 conn.execute(
                     text(
-                        "SELECT COUNT(*) FROM meeting_analyzer.speaker_embeddings "
+                        "SELECT COUNT(*) FROM meeting_analyzer.speaker_reference_embeddings "
                         "WHERE profile_id = :p"
                     ),
                     {"p": profile_id},
@@ -764,7 +988,7 @@ class SpeakerProfileService:
             )
 
     def delete_profile(self, profile_id: str) -> None:
-        """Delete a profile; assignments and embeddings survive unlinked."""
+        """Delete a profile; assignments and meeting embeddings survive unlinked."""
 
         with self._engine.begin() as conn:
             result = conn.execute(
@@ -773,6 +997,53 @@ class SpeakerProfileService:
             )
         if result.rowcount == 0:
             raise SpeakerProfilingError("Speaker profile not found.")
+
+    def mark_profiling_error(self, *, meeting_id: str, transcript_id: str, error: str) -> None:
+        """Persist `error` decision for diarized labels when profiling fails."""
+
+        eval_time = _now_sql(self._engine)
+        threshold = float(self._settings.voice_match_threshold)
+        with self._engine.begin() as conn:
+            labels = _diarized_labels(conn, transcript_id)
+            profiles_evaluated = conn.execute(
+                text(
+                    "SELECT COUNT(DISTINCT profile_id) FROM meeting_analyzer.speaker_reference_embeddings"
+                )
+            ).scalar_one()
+            for label in labels:
+                conn.execute(
+                    text(
+                        "UPDATE meeting_analyzer.speaker_embeddings SET "
+                        "decision='error', profiles_evaluated=:pe, match_threshold=:mt, evaluated_at=:ea "
+                        "WHERE transcript_id=:t AND local_label=:label"
+                    ),
+                    {
+                        "t": transcript_id,
+                        "label": label,
+                        "pe": int(profiles_evaluated),
+                        "mt": threshold,
+                        "ea": eval_time,
+                    },
+                )
+        logger.warning("Profiling marked error for meeting %s: %s", meeting_id, error)
+
+
+def _diarized_labels(conn, transcript_id: str) -> list[str]:
+    rows = conn.execute(
+        text(
+            "SELECT DISTINCT segment->>'speaker' AS label "
+            "FROM meeting_analyzer.transcripts t "
+            "CROSS JOIN LATERAL jsonb_array_elements(COALESCE(t.segments, '[]'::jsonb)) segment "
+            "WHERE t.id=:t AND segment->>'speaker' IS NOT NULL AND btrim(segment->>'speaker') <> ''"
+        ),
+        {"t": transcript_id},
+    ).all()
+    return [str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()]
+
+
+def _now_sql(engine: Engine):
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT now()")).scalar_one()
 
 
 def _json(value: Any) -> str:

@@ -927,7 +927,7 @@ Real environment variables take precedence over `.env` values.
 | `TEAMMEETINGAI_GROQ_TIMEOUT` | `60` | Request timeout |
 | `TEAMMEETINGAI_GROQ_API_KEY` | Blank | Groq API key |
 | `TEAMMEETINGAI_VOICE_PROFILING` | Unset | Enables voice profiling |
-| `TEAMMEETINGAI_VOICE_MATCH_THRESHOLD` | `0.80` | Suggested match threshold
+| `TEAMMEETINGAI_VOICE_MATCH_THRESHOLD` | `0.70` | Automatic match threshold (cosine similarity)
 
 
 ## Centralized Database Architecture – Future Supabase Integration

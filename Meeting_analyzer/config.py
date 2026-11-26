@@ -184,15 +184,13 @@ class Settings:
     # speakers reported as 5).
     sarvam_num_speakers: int = 0
 
-    # Voice profiling V1.  Requires the optional 'resemblyzer' package;
-    # without the flag (or the package) the pipeline behaves exactly as
-    # before and no voice embeddings are computed.  Matching never assigns
-    # an identity by itself: automatic matches are 'suggested' only and the
-    # user confirms them in the UI.
-    voice_profiling_enabled: bool = False
-    # Cosine similarity at or above which a match becomes an automatic
-    # 'suggested' assignment (still user-confirmable).
-    voice_match_threshold: float = 0.80
+    # Voice profiling is opt-in. Clear high-confidence matches are confirmed
+    # automatically; low-confidence and ambiguous matches remain unknown.
+    voice_profiling_enabled: bool = True
+    # Minimum cosine similarity for automatic identity confirmation.
+    voice_match_threshold: float = 0.70
+    # Minimum lead over the second-best profile to count as unambiguous.
+    voice_match_ambiguity_margin: float = 0.05
     # Cosine similarity at or above which a profile is offered as a manual
     # candidate in the review UI (below the auto-suggest threshold).
     voice_review_threshold: float = 0.70
@@ -304,7 +302,10 @@ def load_settings() -> Settings:
         sarvam_num_speakers=_int_env("TEAMMEETINGAI_SARVAM_NUM_SPEAKERS", 0),
         voice_profiling_enabled=_bool_env("TEAMMEETINGAI_VOICE_PROFILING"),
         voice_match_threshold=_float_env(
-            "TEAMMEETINGAI_VOICE_MATCH_THRESHOLD", 0.80
+            "TEAMMEETINGAI_VOICE_MATCH_THRESHOLD", 0.70
+        ),
+        voice_match_ambiguity_margin=_float_env(
+            "TEAMMEETINGAI_VOICE_MATCH_AMBIGUITY_MARGIN", 0.05
         ),
         voice_review_threshold=_float_env(
             "TEAMMEETINGAI_VOICE_REVIEW_THRESHOLD", 0.70

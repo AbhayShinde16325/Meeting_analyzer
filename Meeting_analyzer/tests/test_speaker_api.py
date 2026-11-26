@@ -1,8 +1,8 @@
 """Voice profiling tests against real PostgreSQL (API + pipeline + review).
 
-Covers the identity policy end to end: automatic matching only suggests,
-user confirmation attaches embeddings to profiles, rejections survive
-re-profiling, and low-confidence candidates never become assignments.
+Covers automatic clear-match confirmation, explicit enrollment references,
+manual decision preservation, retry idempotency, and Unknown handling for
+low-confidence or ambiguous matches.
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ class _FakeEncoder:
     VECTORS = {
         "spk-a": [1.0, 0.0, 0.0],
         "spk-b": [0.0, 1.0, 0.0],
-        "spk-c": [0.72, 0.72, 0.0],  # cosine 0.71 vs spk-a: candidate only
+        "spk-c": [0.72, 0.72, 0.0],  # cosine ~0.707 vs spk-a/b: ambiguous when both refs exist
+        "spk-low": [0.69, 0.72, 0.0],  # cosine ~0.692 vs spk-a: below 0.70 threshold
         "spk-dup": [1.0, 0.0, 0.0],  # identical to spk-a: same voice
     }
 
@@ -55,6 +56,14 @@ class _FakeEncoder:
             )
             for label in labels
         ]
+
+    def embed_reference_audio(self, audio_path):
+        name = Path(audio_path).name.lower()
+        for key, vec in self.VECTORS.items():
+            if key in name:
+                return list(vec), 10.0
+        # Allow tests to encode vector via filename like ref-1-0-0.wav? not needed now.
+        return [1.0, 0.0, 0.0], 10.0
 
 
 def _build_enabled_profiler(engine):
@@ -261,6 +270,18 @@ class TestProfilingJob:
         assert job["status"] == "succeeded"
         assert "No diarized speakers" in job["message"]
 
+    def test_repeated_profile_request_reuses_active_job(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        api, meeting_id = host_and_meeting
+        _insert_diarized_transcript(pg_engine, meeting_id)
+        first = api.post(f"/meetings/{meeting_id}/speakers/profile")
+        second = api.post(f"/meetings/{meeting_id}/speakers/profile")
+        assert first.status_code == second.status_code == 202
+        assert first.json()["id"] == second.json()["id"]
+        jobs = api.get(f"/meetings/{meeting_id}/jobs").json()
+        assert sum(j["job_type"] == "profiling" for j in jobs) == 1
+
     def test_profiling_requires_transcript(self, speaker_api, host_and_meeting):
         _api, meeting_id = host_and_meeting
         response = speaker_api.post(f"/meetings/{meeting_id}/speakers/profile")
@@ -301,16 +322,18 @@ class TestAutomaticChaining:
             if j["job_type"] == "transcription" and j["status"] == "queued"
         )
 
-        # The transcription fake has no diarized segments, so profiling
-        # succeeds with an explanatory message — the point is that the
-        # profiling job is enqueued and runs without any manual action.
+        # The transcription fake has no diarized segments. Profiling is queued
+        # as a separate background job and is not run in the transcription call.
         api.app.state.pipeline.run_job(transcription_job_id)
 
         jobs = api.get(f"/meetings/{meeting_id}/jobs").json()
         profiling_jobs = [j for j in jobs if j["job_type"] == "profiling"]
-        assert profiling_jobs, "transcription must enqueue a profiling job"
-        assert profiling_jobs[0]["status"] == "succeeded"
-        assert "No diarized speakers" in profiling_jobs[0]["message"]
+        assert len(profiling_jobs) == 1, "transcription must enqueue one profiling job"
+        assert profiling_jobs[0]["status"] == "queued"
+        api.app.state.pipeline.run_job(profiling_jobs[0]["id"])
+        finished = next(j for j in api.get(f"/meetings/{meeting_id}/jobs").json() if j["id"] == profiling_jobs[0]["id"])
+        assert finished["status"] == "succeeded"
+        assert "No diarized speakers" in finished["message"]
 
     def test_profiling_failure_does_not_fail_transcription(
         self, speaker_api, pg_engine, host_and_meeting, monkeypatch
@@ -371,42 +394,133 @@ class TestAutomaticChaining:
         assert transcription_job["status"] == "succeeded"
         profiling_jobs = [j for j in jobs if j["job_type"] == "profiling"]
         assert profiling_jobs
+        assert profiling_jobs[0]["status"] == "queued"
+        api.app.state.pipeline.run_job(profiling_jobs[0]["id"])
+        profiling_jobs = [j for j in api.get(f"/meetings/{meeting_id}/jobs").json() if j["job_type"] == "profiling"]
         assert profiling_jobs[0]["status"] == "failed"
         assert "setuptools<81" in profiling_jobs[0]["error"]
+        assert api.get(f"/meetings/{meeting_id}").json()["status"] == "transcribed"
 
 
 class TestMatchingAndReview:
-    def test_confirm_creates_profile_and_suggests_next_meeting(
+    def _enroll_ref(self, api, profile_id: str, label: str = "spk-a"):
+        files = {"file": (f"{label}.wav", b"RIFF" + b"\0" * 120, "audio/wav")}
+        resp = api.post(f"/profiles/{profile_id}/enroll", files=files)
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_enrollment_embedding_is_reused_as_profile_reference(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        api, meeting_id = host_and_meeting
+        _insert_diarized_transcript(pg_engine, meeting_id)
+        profile = api.post("/profiles", json={"display_name": "Enrolled"}).json()
+        before_meetings = pg_engine.connect().execute(text("SELECT COUNT(*) FROM meeting_analyzer.meetings")).scalar_one()
+        before_transcripts = pg_engine.connect().execute(text("SELECT COUNT(*) FROM meeting_analyzer.transcripts")).scalar_one()
+        self._enroll_ref(api, profile["id"], "spk-a")
+        with pg_engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM meeting_analyzer.meetings")).scalar_one() == before_meetings
+            assert conn.execute(text("SELECT COUNT(*) FROM meeting_analyzer.transcripts")).scalar_one() == before_transcripts
+            ref_count = conn.execute(text(
+                "SELECT COUNT(*) FROM meeting_analyzer.speaker_reference_embeddings WHERE profile_id=:p"
+            ), {"p": profile["id"]}).scalar_one()
+        assert ref_count == 1
+        centroids = api.app.state.speaker_profiler._profile_centroids()
+        assert centroids[profile["id"]] == [1.0, 0.0, 0.0]
+
+    def test_reprofiling_existing_manual_decision_repairs_embedding_link(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        api, meeting_id = host_and_meeting
+        transcript_id = _insert_diarized_transcript(pg_engine, meeting_id)
+        profile = api.post("/profiles", json={"display_name": "Manual"}).json()
+        with pg_engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO meeting_analyzer.speaker_assignments "
+                "(id,meeting_id,transcript_id,local_label,profile_id,confidence,status,origin) "
+                "VALUES (gen_random_uuid(),:m,:t,'spk-a',:p,1.0,'confirmed','manual')"
+            ), {"m": meeting_id, "t": transcript_id, "p": profile["id"]})
+        _run_profiling_job(api, meeting_id)
+        with pg_engine.connect() as conn:
+            linked = conn.execute(text(
+                "SELECT profile_id FROM meeting_analyzer.speaker_embeddings "
+                "WHERE transcript_id=:t AND local_label='spk-a'"
+            ), {"t": transcript_id}).scalar_one()
+            origin = conn.execute(text(
+                "SELECT origin FROM meeting_analyzer.speaker_assignments "
+                "WHERE transcript_id=:t AND local_label='spk-a'"
+            ), {"t": transcript_id}).scalar_one()
+        assert str(linked) == profile["id"]
+        assert origin == "manual"
+
+    def test_clear_profile_match_is_returned_as_confirmed_name(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        api, meeting_id = host_and_meeting
+        transcript_id = _insert_diarized_transcript(pg_engine, meeting_id)
+        with pg_engine.connect() as conn:
+            original_segments = conn.execute(text(
+                "SELECT segments FROM meeting_analyzer.transcripts WHERE id=:t"
+            ), {"t": transcript_id}).scalar_one()
+        profile = api.post("/profiles", json={"display_name": "Alice"}).json()
+        self._enroll_ref(api, profile["id"], "spk-a")
+
+        _run_profiling_job(api, meeting_id)
+
+        speaker = _speaker_by_label(api, meeting_id, "spk-a")
+        with pg_engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT segments FROM meeting_analyzer.transcripts WHERE id=:t"
+            ), {"t": transcript_id}).scalar_one() == original_segments
+            origin = conn.execute(text(
+                "SELECT origin FROM meeting_analyzer.speaker_assignments WHERE transcript_id=:t AND local_label='spk-a'"
+            ), {"t": transcript_id}).scalar_one()
+        assert speaker["status"] == "confirmed"
+        assert speaker["origin"] == "auto"
+        assert origin == "auto"
+        assert speaker["profile_id"] == profile["id"]
+        assert speaker["profile_name"] == "Alice"
+        assert speaker["best_score"] >= 0.70
+        assert speaker["threshold"] == 0.70
+        assert speaker["decision"] == "matched"
+
+    def test_confirmed_profile_is_reused_automatically_in_next_meeting(
         self, speaker_api, pg_engine, host_and_meeting
     ):
         api, meeting_id = host_and_meeting
         _insert_diarized_transcript(pg_engine, meeting_id)
         _run_profiling_job(api, meeting_id)
 
-        # No profiles yet: nothing suggested.
         speaker = _speaker_by_label(api, meeting_id, "spk-a")
         assert speaker["status"] is None
 
-        # Confirm spk-a into a brand-new profile.
+        # Confirm spk-a into a new profile but DO NOT upload reference audio.
         confirmed = api.post(
             f"/meetings/{meeting_id}/speakers/spk-a/assign",
             json={"new_profile_name": "Alice", "status": "confirmed"},
         )
         assert confirmed.status_code == 200, confirmed.text
-        assert confirmed.json()["status"] == "confirmed"
-        assert confirmed.json()["profile_name"] == "Alice"
+        profile_id = confirmed.json()["profile_id"]
 
-        # A second meeting with the same voice must produce a suggestion.
         user = api.post("/users", json={"display_name": "Host2"}).json()
         from test_api import _ingest_meeting
 
         meeting2 = _ingest_meeting(api, user["id"], title="Second meeting")["id"]
         _insert_diarized_transcript(pg_engine, meeting2)
         _run_profiling_job(api, meeting2)
-        suggested = _speaker_by_label(api, meeting2, "spk-a")
-        assert suggested["status"] == "suggested"
-        assert suggested["profile_name"] == "Alice"
-        assert suggested["confidence"] >= 0.8
+        matched = _speaker_by_label(api, meeting2, "spk-a")
+        # Reference-only: confirmed meeting assignments are not references.
+        assert matched["profile_id"] != profile_id
+        assert matched["decision"] in ("no_reference", "below_threshold", "ambiguous")
+        assert matched["status"] in (None, "suggested")
+
+        # After explicit reference upload, next profiling can match.
+        self._enroll_ref(api, profile_id, "spk-a")
+        _run_profiling_job(api, meeting2)
+        matched2 = _speaker_by_label(api, meeting2, "spk-a")
+        assert matched2["status"] == "confirmed"
+        assert matched2["profile_name"] == "Alice"
+        assert matched2["origin"] == "auto"
 
     def test_rejection_survives_reprofiling(
         self, speaker_api, pg_engine, host_and_meeting
@@ -418,28 +532,48 @@ class TestMatchingAndReview:
             f"/meetings/{meeting_id}/speakers/spk-b/assign",
             json={"status": "rejected"},
         )
-        # Re-profile: the user's rejection must not be overwritten.
         _run_profiling_job(api, meeting_id)
         speaker = _speaker_by_label(api, meeting_id, "spk-b")
         assert speaker["status"] == "rejected"
+        assert speaker["origin"] == "manual"
 
-    def test_low_confidence_is_candidate_not_assignment(
+    def test_low_confidence_remains_unknown(
+        self, speaker_api, pg_engine, host_and_meeting
+    ):
+        api, meeting_id = host_and_meeting
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "hi", "speaker": "spk-a"},
+            {"start": 5.0, "end": 10.0, "text": "hey", "speaker": "spk-low"},
+        ]
+        with pg_engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO meeting_analyzer.transcripts (id,meeting_id,provider,model,is_primary,text,segments) "
+                "VALUES (gen_random_uuid(),:m,'fake','fake-model',true,'t',CAST(:seg AS jsonb))"
+            ), {"m": meeting_id, "seg": json.dumps(segments)})
+        profile = api.post("/profiles", json={"display_name": "AliceLow"}).json()
+        self._enroll_ref(api, profile["id"], "spk-a")
+        _run_profiling_job(api, meeting_id)
+        speaker = _speaker_by_label(api, meeting_id, "spk-low")
+        assert speaker["status"] is None
+        assert speaker["profile_id"] is None
+        assert speaker["decision"] == "below_threshold"
+        assert speaker["best_profile_id"] == profile["id"]
+        assert speaker["best_score"] is not None and speaker["best_score"] < 0.70
+
+    def test_ambiguous_match_remains_unknown(
         self, speaker_api, pg_engine, host_and_meeting
     ):
         api, meeting_id = host_and_meeting
         _insert_diarized_transcript(pg_engine, meeting_id)
+        p1 = api.post("/profiles", json={"display_name": "Alice"}).json()
+        p2 = api.post("/profiles", json={"display_name": "Bob"}).json()
+        self._enroll_ref(api, p1["id"], "spk-a")
+        self._enroll_ref(api, p2["id"], "spk-b")
         _run_profiling_job(api, meeting_id)
-        # Confirm spk-a (vector [1,0,0]).
-        api.post(
-            f"/meetings/{meeting_id}/speakers/spk-a/assign",
-            json={"new_profile_name": "Alice", "status": "confirmed"},
-        )
-        # spk-c (cosine ~0.71 to Alice) is a candidate, never auto-assigned.
         speaker = _speaker_by_label(api, meeting_id, "spk-c")
         assert speaker["status"] is None
-        assert speaker["candidates"], "candidate should be offered for review"
-        assert speaker["candidates"][0]["display_name"] == "Alice"
-        assert 0.70 <= speaker["candidates"][0]["confidence"] < 0.80
+        assert speaker["profile_id"] is None
+        assert speaker["decision"] == "ambiguous"
 
     def test_confirm_requires_profile_or_new_name(
         self, speaker_api, pg_engine, host_and_meeting
@@ -503,3 +637,87 @@ class TestMatchingAndReview:
     ):
         _api, meeting_id = host_and_meeting
         assert speaker_api.get(f"/meetings/{meeting_id}/speakers").json() == []
+
+    def test_reference_only_matching_and_diagnostics(self, speaker_api, pg_engine, host_and_meeting):
+        api, meeting_id = host_and_meeting
+        transcript_id = _insert_diarized_transcript(pg_engine, meeting_id)
+        profile = api.post("/profiles", json={"display_name": "DiagRefUser"}).json()
+        with pg_engine.begin() as conn:
+            # Isolate: remove references from other tests in this module-scoped fixture.
+            conn.execute(text("DELETE FROM meeting_analyzer.speaker_reference_embeddings"))
+        _run_profiling_job(api, meeting_id)
+        spk = _speaker_by_label(api, meeting_id, "spk-a")
+        assert spk["decision"] == "no_reference"
+        assert spk["reference_available"] is False
+        assert spk["reference_count"] == 0
+        assert spk["profiles_evaluated"] == 0
+
+        self._enroll_ref(api, profile["id"], "spk-a")
+        _run_profiling_job(api, meeting_id)
+        spk = _speaker_by_label(api, meeting_id, "spk-a")
+        assert spk["decision"] == "matched"
+        assert spk["status"] == "confirmed"
+        assert spk["origin"] == "auto"
+        assert spk["reference_available"] is True
+        assert spk["reference_count"] >= 1
+        assert spk["best_profile_name"] == "DiagRefUser"
+        assert spk["best_score"] >= 0.70
+        assert spk["threshold"] == 0.70
+        assert spk["profiles_evaluated"] >= 1
+        assert spk["evaluated_at"] is not None
+
+        with pg_engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT best_score, decision, profiles_evaluated, match_threshold, evaluated_at FROM meeting_analyzer.speaker_embeddings "
+                "WHERE transcript_id=:t AND local_label='spk-a'"
+            ), {"t": transcript_id}).mappings().one()
+        assert row["decision"] == "matched"
+        assert float(row["best_score"]) >= 0.70
+        assert float(row["match_threshold"]) == 0.70
+        assert int(row["profiles_evaluated"]) >= 1
+        assert row["evaluated_at"] is not None
+
+    def test_manual_assignment_preserved_and_auto_recalculated(self, speaker_api, pg_engine, host_and_meeting):
+        api, meeting_id = host_and_meeting
+        transcript_id = _insert_diarized_transcript(pg_engine, meeting_id)
+        p_a = api.post("/profiles", json={"display_name": "ProvA"}).json()
+        p_b = api.post("/profiles", json={"display_name": "ProvB"}).json()
+        self._enroll_ref(api, p_a["id"], "spk-a")
+        self._enroll_ref(api, p_b["id"], "spk-b")
+        _run_profiling_job(api, meeting_id)
+        assert _speaker_by_label(api, meeting_id, "spk-a")["status"] == "confirmed"
+        # Manual override
+        api.post(f"/meetings/{meeting_id}/speakers/spk-a/assign", json={"profile_id": p_b["id"], "status": "confirmed"})
+        # Reprofile: manual confirmed must survive
+        _run_profiling_job(api, meeting_id)
+        spk = _speaker_by_label(api, meeting_id, "spk-a")
+        assert spk["status"] == "confirmed"
+        assert spk["origin"] == "manual"
+        assert spk["profile_id"] == p_b["id"]
+        # spk-b should be auto recalculated/matched normally
+        spk_b = _speaker_by_label(api, meeting_id, "spk-b")
+        assert spk_b["origin"] == "auto"
+        assert spk_b["status"] == "confirmed"
+
+    def test_older_meeting_reprofiling_uses_current_threshold(self, speaker_api, pg_engine, host_and_meeting):
+        api, meeting_id = host_and_meeting
+        transcript_id = _insert_diarized_transcript(pg_engine, meeting_id)
+        profile = api.post("/profiles", json={"display_name": "Threshold70"}).json()
+        self._enroll_ref(api, profile["id"], "spk-a")
+        _run_profiling_job(api, meeting_id)
+
+        with pg_engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE meeting_analyzer.speaker_embeddings SET match_threshold=0.80, evaluated_at=now() - interval '1 day' "
+                "WHERE transcript_id=:t AND local_label='spk-a'"
+            ), {"t": transcript_id})
+        before = _speaker_by_label(api, meeting_id, "spk-a")
+        assert before["threshold"] == 0.80
+
+        _run_profiling_job(api, meeting_id)
+        after = _speaker_by_label(api, meeting_id, "spk-a")
+        assert after["threshold"] == 0.70
+        assert after["decision"] == "matched"
+        assert after["status"] == "confirmed"
+        assert after["evaluated_at"] is not None
+        assert after["evaluated_at"] != before["evaluated_at"]

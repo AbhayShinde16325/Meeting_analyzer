@@ -153,6 +153,50 @@ class TestEmbeddingsFromWav:
         )
         assert [round(p, 2) for p, _ in events] == [0.5, 1.0]
 
+    def test_zero_length_segments_do_not_keyerror(self):
+        segments = [
+            {"start": 1.0, "end": 1.0, "text": "", "speaker": "Speaker 1"},
+            {"start": 2.0, "end": 2.0, "text": "", "speaker": "Speaker 2"},
+        ]
+        results = embeddings_from_wav(
+            self._wav(3.0),
+            segments,
+            embed_utterance=lambda chunk: _unit(2, 0),
+            min_seconds=1.0,
+            max_segments_per_speaker=20,
+        )
+        assert results == []
+
+    def test_short_only_segments_are_skipped(self):
+        segments = [
+            {"start": 0.0, "end": 0.2, "text": "hi", "speaker": "S1"},
+            {"start": 0.2, "end": 0.4, "text": "yo", "speaker": "S1"},
+        ]
+        results = embeddings_from_wav(
+            self._wav(1.0),
+            segments,
+            embed_utterance=lambda chunk: _unit(2, 0),
+            min_seconds=1.0,
+            max_segments_per_speaker=20,
+        )
+        assert results == []
+
+    def test_mixed_valid_and_invalid_labels_preserve_valid(self):
+        segments = [
+            {"start": 0.0, "end": 0.0, "text": "", "speaker": "BadZero"},
+            {"start": 1.0, "end": 1.2, "text": "short", "speaker": "BadShort"},
+            {"start": 2.0, "end": 4.0, "text": "ok", "speaker": "Good"},
+        ]
+        results = embeddings_from_wav(
+            self._wav(5.0),
+            segments,
+            embed_utterance=lambda chunk: _unit(3, 0),
+            min_seconds=1.0,
+            max_segments_per_speaker=20,
+        )
+        assert [r.local_label for r in results] == ["Good"]
+        assert results[0].source_seconds == pytest.approx(2.0)
+
 
 def test_label_embedding_is_frozen():
     embedding = LabelEmbedding(local_label="S", embedding=[1.0], source_seconds=1.0)
@@ -220,3 +264,24 @@ class TestDependencyDetection:
         )
         with pytest.raises(SpeakerProfilingError, match="setuptools<81"):
             sp.get_encoder()
+
+
+class TestMatchingDecision:
+    def test_threshold_boundaries(self):
+        decide = sp.SpeakerProfileService._decision
+        assert decide(0.69, None, 1, 0.70, 0.05) == "below_threshold"
+        assert decide(0.70, None, 1, 0.70, 0.05) == "matched"
+        assert decide(0.71, None, 1, 0.70, 0.05) == "matched"
+
+    def test_ambiguity_margin(self):
+        decide = sp.SpeakerProfileService._decision
+        # difference 0.04 < 0.05 => ambiguous
+        assert decide(0.74, 0.70, 2, 0.70, 0.05) == "ambiguous"
+        # difference exactly 0.05 => not ambiguous
+        assert decide(0.75, 0.70, 2, 0.70, 0.05) == "matched"
+        # second below threshold does not create ambiguity
+        assert decide(0.70, 0.69, 2, 0.70, 0.05) == "matched"
+
+    def test_no_reference(self):
+        decide = sp.SpeakerProfileService._decision
+        assert decide(0.95, None, 0, 0.70, 0.05) == "no_reference"

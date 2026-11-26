@@ -166,6 +166,8 @@ export const api = {
     form.append('file', file, file.name)
     return request(`/profiles/${profileId}/enroll`, { method: 'POST', body: form, timeoutMs: 300000 })
   },
+  listProfileReferences: (profileId) => request(`/profiles/${profileId}/references`),
+  deleteProfileReference: (profileId, referenceId) => request(`/profiles/${profileId}/references/${referenceId}`, { method: 'DELETE' }),
   listJobs: (meetingId) => request(`/meetings/${meetingId}/jobs`),
   getSpeakerProfiles: () => request('/profiles'),
   transcribe: (meetingId) => request(`/meetings/${meetingId}/transcribe`, { method: 'POST' }),

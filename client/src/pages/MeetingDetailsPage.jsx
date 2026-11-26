@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import { useApp } from '../App'
@@ -18,6 +18,8 @@ export default function MeetingDetailsPage() {
   const [newSpeakerNames, setNewSpeakerNames] = useState({})
   const [renameProfile, setRenameProfile] = useState({})
   const [sampleAudio, setSampleAudio] = useState({})
+  const [profileRefs, setProfileRefs] = useState({})
+  const [refsOpen, setRefsOpen] = useState({})
   const canManage = true
 
   const load = async (silent = false) => {
@@ -35,17 +37,28 @@ export default function MeetingDetailsPage() {
   }
 
   useEffect(() => { load() }, [meetingId])
+
+  const primary = useMemo(() => data.transcripts.find(t => t.is_primary) || data.transcripts[0], [data.transcripts])
+  const audio = useMemo(() => data.files.find(f => f.kind === 'original_audio_48k') || data.files.find(f => (f.kind || '').startsWith('original_audio')), [data.files])
+  const attachments = useMemo(() => data.files.filter(f => f.kind === 'attachment'), [data.files])
+  const activeJob = data.jobs.find(j => ['queued', 'running'].includes(j.status))
+  const profilingJob = useMemo(() => data.jobs.find(j => j.job_type === 'profiling') || null, [data.jobs])
+  const lastProfilingStatus = useRef(null)
+
   useEffect(() => {
     const active = data.jobs?.some(j => ['queued', 'running'].includes(j.status)) || ['recorded', 'transcribed', 'analyzing'].includes(data.meeting?.status)
     if (!active) return
     const t = setInterval(() => load(true), 4000)
     return () => clearInterval(t)
   }, [data.jobs, data.meeting?.status, meetingId])
-
-  const primary = useMemo(() => data.transcripts.find(t => t.is_primary) || data.transcripts[0], [data.transcripts])
-  const audio = useMemo(() => data.files.find(f => f.kind === 'original_audio_48k') || data.files.find(f => (f.kind || '').startsWith('original_audio')), [data.files])
-  const attachments = useMemo(() => data.files.filter(f => f.kind === 'attachment'), [data.files])
-  const activeJob = data.jobs.find(j => ['queued', 'running'].includes(j.status))
+  useEffect(() => {
+    const s = profilingJob?.status || null
+    const prev = lastProfilingStatus.current
+    if (prev && ['queued', 'running'].includes(prev) && s && ['succeeded', 'failed', 'cancelled'].includes(s)) {
+      load(true)
+    }
+    lastProfilingStatus.current = s
+  }, [profilingJob?.status, profilingJob?.id])
 
   const act = async (name, fn) => { setBusy(name); setError(''); try { await fn(); await load(true) } catch (e) { setError(e.message) } finally { setBusy('') } }
 
@@ -60,6 +73,36 @@ export default function MeetingDetailsPage() {
     await act(`speaker:${localLabel}`, () => api.assignMeetingSpeaker(meetingId, localLabel, fields))
   }
 
+  const fmtPct = (v) => (v === null || v === undefined ? '—' : `${Math.round(Number(v) * 100)}%`)
+  const fmtNum = (v) => (v === null || v === undefined ? '—' : String(v))
+  const fmtDur = (job) => {
+    if (!job?.started_at) return '—'
+    const start = new Date(job.started_at).getTime()
+    const end = job.finished_at ? new Date(job.finished_at).getTime() : Date.now()
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '—'
+    return `${((end - start) / 1000).toFixed(1)}s`
+  }
+  const decisionLabel = (d) => ({
+    matched: 'Matched',
+    below_threshold: 'Below threshold',
+    ambiguous: 'Ambiguous',
+    no_reference: 'No reference',
+    no_embedding: 'No embedding',
+    error: 'Error',
+  }[d] || (d ? d : '—'))
+
+  const loadRefs = async (profileId) => {
+    try {
+      const refs = await api.listProfileReferences(profileId)
+      setProfileRefs(s => ({ ...s, [profileId]: refs }))
+    } catch (e) { setError(e.message) }
+  }
+  const toggleRefs = async (profileId) => {
+    const next = !refsOpen[profileId]
+    setRefsOpen(s => ({ ...s, [profileId]: next }))
+    if (next && !profileRefs[profileId]) await loadRefs(profileId)
+  }
+
   const speakerDisplay = (segSpeaker) => {
     if (!segSpeaker) return { name: 'Unknown Speaker', status: 'unknown' }
     const match = data.speakers.find(s => s.local_label === segSpeaker)
@@ -72,7 +115,9 @@ export default function MeetingDetailsPage() {
   }
 
   if (loading) return <div className="page"><div className="empty card">Loading meeting...</div></div>
-  if (error && !data.meeting) return <div className="page"><div className="alert error">{error}</div></div>
+  if (!data.meeting) {
+    return <div className="page"><div className="alert error">{error || 'Meeting could not be loaded.'}</div><button className="btn" onClick={() => nav('/')}>Back to meetings</button></div>
+  }
   const m = data.meeting
   return (
     <div className="page">
@@ -148,16 +193,36 @@ export default function MeetingDetailsPage() {
 
       {tab === 'speakers' && <div className="card">
         <div className="section-title">Speaker review</div>
-        <p className="muted small">Voice matching only suggests profiles. Names appear in transcript after confirmation. {canManage ? '' : ''}</p>
+        <p className="muted small">Reference-audio-based profiling. Clear, unambiguous matches at or above threshold are auto-confirmed; ambiguous/below-threshold/no-reference speakers remain Unknown. Manual assignments are preserved.</p>
+        <div className="subsection" style={{ marginBottom: 16 }}>
+          <div className="sub-title">Profiling job</div>
+          {!profilingJob ? <div className="muted small">No profiling job yet.</div> : <div className="muted small">
+            Status: <span className={`badge status-${profilingJob.status}`}>{profilingJob.status}</span>
+            {' • '}Started: {profilingJob.started_at ? formatDate(profilingJob.started_at) : '—'}
+            {' • '}Duration: {fmtDur(profilingJob)}
+            {' • '}Error: {profilingJob.error || '—'}
+          </div>}
+        </div>
         <div className="speaker-list">
           {data.speakers.length === 0 ? <div className="empty">No speaker data. Run transcription and speaker profiling.</div> : data.speakers.map(sp => {
             const candidates = sp.candidates || []
             const selected = sp.profile_id || ''
             return (
-              <div key={sp.local_label} className="speaker-row">
-                <div style={{ minWidth: 220 }}>
-                  <div className="speaker-name">{sp.local_label} {sp.profile_name ? <span className="muted">→ {sp.profile_name}</span> : null}</div>
-                  <div className="muted small">{sp.segment_count} segments • {(sp.speech_seconds || 0).toFixed(1)}s • {sp.status || 'unassigned'} {sp.confidence ? `• ${Math.round(sp.confidence * 100)}%` : ''}</div>
+              <div key={sp.local_label} className="speaker-row" style={{ alignItems: 'flex-start' }}>
+                <div style={{ minWidth: 320 }}>
+                  <div className="speaker-name">{sp.local_label} {sp.profile_name ? <span className="muted">→ {sp.profile_name}</span> : <span className="muted">→ Unknown</span>}</div>
+                  <div className="muted small">
+                    Segments: {fmtNum(sp.segment_count)} • Speech: {(sp.speech_seconds || 0).toFixed(1)}s • Assignment: {sp.status || 'unassigned'}{sp.origin ? ` (${sp.origin})` : ''}
+                  </div>
+                  <div className="muted small">
+                    Reference available: {sp.reference_available ? 'Yes' : 'No'} • Best ref: {sp.best_profile_name || '—'} • Similarity: {fmtPct(sp.best_score)} • Threshold: {fmtPct(sp.threshold)}
+                  </div>
+                  <div className="muted small">
+                    Decision: {decisionLabel(sp.decision)} • Profiles evaluated: {fmtNum(sp.profiles_evaluated)} • Evaluated: {sp.evaluated_at ? formatDate(sp.evaluated_at) : '—'}
+                  </div>
+                  <div className="muted small">
+                    Job: {sp.job_status || profilingJob?.status || '—'} • Processing time: {fmtDur(profilingJob)} • Error: {sp.job_error || profilingJob?.error || '—'}
+                  </div>
                   {(sp.same_voice_labels || []).length > 0 && <div className="muted small">Same voice as: {sp.same_voice_labels.join(', ')}</div>}
                 </div>
                 <div className="speaker-actions" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -177,17 +242,30 @@ export default function MeetingDetailsPage() {
         </div>
         <div className="subsection" style={{ marginTop: 24 }}>
           <div className="sub-title">Speaker profiles</div>
-          <p className="muted small">Enroll a clean voice sample (several seconds of natural speech). Voice identity comes from audio embeddings; text is not used. Low-quality/short samples may be rejected.</p>
-          <div className="table-wrap"><table><thead><tr><th>Name</th><th>Embeddings</th><th>Updated</th><th>Enroll sample</th><th></th></tr></thead><tbody>
+          <p className="muted small">Upload explicit reference audio samples for each profile. Only reference samples are used for matching; meeting embeddings are diagnostics only. Profiles with no reference cannot be matched.</p>
+          <div className="table-wrap"><table><thead><tr><th>Name</th><th>Reference samples</th><th>Updated</th><th>Enroll sample</th><th></th></tr></thead><tbody>
             {data.profiles.length === 0 ? <tr><td colSpan="5" className="empty">No profiles.</td></tr> : data.profiles.map(p => (
-              <tr key={p.id}><td>{p.display_name}</td><td>{p.embedding_count ?? '—'}</td><td className="small">{formatDate(p.updated_at || p.created_at)}</td>
-                <td>{canManage && <input type="file" accept="audio/*" onChange={e => setSampleAudio(s => ({ ...s, [p.id]: e.target.files?.[0] || null }))} />}</td>
-                <td className="actions">{canManage && <>
-                  <button className="btn small" disabled={!sampleAudio[p.id] || busy===`enroll:${p.id}`} onClick={() => act(`enroll:${p.id}`, async () => { await api.enrollSpeakerProfile(p.id, sampleAudio[p.id]); setSampleAudio(s => ({ ...s, [p.id]: null })); })}>Enroll</button>
-                  <input style={{ width: 140, marginRight: 6 }} placeholder="Rename" value={renameProfile[p.id] || ''} onChange={e => setRenameProfile(s => ({ ...s, [p.id]: e.target.value }))} />
-                  <button className="btn small" disabled={!(renameProfile[p.id] || '').trim()} onClick={() => act(`rp:${p.id}`, async () => { await api.renameSpeakerProfile(p.id, renameProfile[p.id].trim()); setRenameProfile(s => ({ ...s, [p.id]: '' })) })}>Rename</button>
-                  <button className="btn small danger" onClick={() => { if (confirm(`Delete profile "${p.display_name}"?`)) act(`dp:${p.id}`, () => api.deleteSpeakerProfile(p.id)) }}>Delete</button>
-                </>}</td></tr>
+              <React.Fragment key={p.id}>
+                <tr>
+                  <td>{p.display_name}{(p.embedding_count ?? 0) === 0 ? <div className="muted small">No reference uploaded</div> : null}</td>
+                  <td>{p.embedding_count ?? '—'}</td>
+                  <td className="small">{formatDate(p.updated_at || p.created_at)}</td>
+                  <td>{canManage && <input type="file" accept="audio/*" onChange={e => setSampleAudio(s => ({ ...s, [p.id]: e.target.files?.[0] || null }))} />}</td>
+                  <td className="actions">{canManage && <>
+                    <button className="btn small" disabled={!sampleAudio[p.id] || busy===`enroll:${p.id}`} onClick={() => act(`enroll:${p.id}`, async () => { await api.enrollSpeakerProfile(p.id, sampleAudio[p.id]); setSampleAudio(s => ({ ...s, [p.id]: null })); if (refsOpen[p.id]) await loadRefs(p.id) })}>Enroll</button>
+                    <button className="btn small" onClick={() => toggleRefs(p.id)}>{refsOpen[p.id] ? 'Hide refs' : 'References'}</button>
+                    <input style={{ width: 140, marginRight: 6 }} placeholder="Rename" value={renameProfile[p.id] || ''} onChange={e => setRenameProfile(s => ({ ...s, [p.id]: e.target.value }))} />
+                    <button className="btn small" disabled={!(renameProfile[p.id] || '').trim()} onClick={() => act(`rp:${p.id}`, async () => { await api.renameSpeakerProfile(p.id, renameProfile[p.id].trim()); setRenameProfile(s => ({ ...s, [p.id]: '' })) })}>Rename</button>
+                    <button className="btn small danger" onClick={() => { if (confirm(`Delete profile "${p.display_name}"?`)) act(`dp:${p.id}`, () => api.deleteSpeakerProfile(p.id)) }}>Delete</button>
+                  </>}</td>
+                </tr>
+                {refsOpen[p.id] && <tr><td colSpan="5">
+                  <div className="muted small" style={{ marginBottom: 6 }}>Reference samples</div>
+                  {!(profileRefs[p.id] || []).length ? <div className="muted small">No reference samples.</div> : <div className="table-wrap"><table><thead><tr><th>File</th><th>Duration</th><th>Provider</th><th>Created</th><th></th></tr></thead><tbody>
+                    {(profileRefs[p.id] || []).map(r => <tr key={r.id}><td>{r.original_filename || '—'}</td><td>{r.source_seconds != null ? `${Number(r.source_seconds).toFixed(1)}s` : '—'}</td><td>{r.provider || '—'} {r.model || ''}</td><td className="small">{formatDate(r.created_at)}</td><td>{canManage && <button className="btn small danger" onClick={() => act(`dr:${r.id}`, async () => { await api.deleteProfileReference(p.id, r.id); await loadRefs(p.id) })}>Delete</button>}</td></tr>)}
+                  </tbody></table></div>}
+                </td></tr>}
+              </React.Fragment>
             ))}
           </tbody></table></div>
         </div>

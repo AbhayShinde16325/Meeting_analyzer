@@ -20,7 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libsndfile1 curl \
+    ffmpeg libsndfile1 curl build-essential python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Meeting_analyzer/requirements.txt ./requirements.txt

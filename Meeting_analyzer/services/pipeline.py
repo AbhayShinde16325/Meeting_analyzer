@@ -106,6 +106,28 @@ class TranscriptionPipeline:
             self._fail_job(job_id, "failed", str(exc))
         except Exception as exc:  # unexpected - keep the server alive
             logger.exception("Job %s failed unexpectedly.", job_id)
+            if str(job.get("job_type")) == "profiling" and self._speaker_profiler is not None:
+                try:
+                    with self._engine.connect() as conn:
+                        primary = (
+                            conn.execute(
+                                text(
+                                    "SELECT id FROM meeting_analyzer.transcripts WHERE meeting_id=:m "
+                                    "AND is_primary=true"
+                                ),
+                                {"m": str(job["meeting_id"])},
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
+                    if primary is not None:
+                        self._speaker_profiler.mark_profiling_error(
+                            meeting_id=str(job["meeting_id"]),
+                            transcript_id=str(primary["id"]),
+                            error=f"Unexpected error: {type(exc).__name__}: {exc}",
+                        )
+                except Exception:
+                    logger.exception("Could not mark profiling error diagnostics.")
             self._fail_job(
                 job_id, "failed", f"Unexpected error: {type(exc).__name__}: {exc}"
             )
@@ -270,15 +292,11 @@ class TranscriptionPipeline:
             except Exception:  # analysis failure must not lose the transcript
                 logger.exception("Chained analysis failed after transcription.")
 
-        # Chain voice profiling automatically when enabled and a real encoder
-        # is available.  Failures are logged and visible on the job row but
-        # never lose the transcript.
+        # Queue profiling separately so the worker can run it after this
+        # transcription job has completed. A profiling failure never fails the
+        # transcript or its meeting status.
         if self._speaker_profiler is not None and self._speaker_profiler.enabled:
-            profiling_job_id = self._enqueue_profiling(meeting_id)
-            try:
-                self.run_job(profiling_job_id)
-            except Exception:
-                logger.exception("Chained profiling failed after transcription.")
+            self._enqueue_profiling(meeting_id)
 
     def _job_latency_seconds(self, job_id: str, conn: Connection) -> float | None:
         """Seconds since the job started running (measured, not estimated)."""
@@ -305,14 +323,30 @@ class TranscriptionPipeline:
 
     def _enqueue_profiling(self, meeting_id: str) -> str:
         with self._engine.begin() as conn:
-            return conn.execute(
+            active = conn.execute(text(
+                "SELECT id FROM meeting_analyzer.processing_jobs WHERE meeting_id=:m "
+                "AND job_type='profiling' AND status IN ('queued','running') "
+                "ORDER BY created_at DESC LIMIT 1"
+            ), {"m": meeting_id}).scalar_one_or_none()
+            if active is not None:
+                return str(active)
+            created = conn.execute(
                 text(
                     "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, "
                     "message) VALUES (gen_random_uuid(), :m, 'profiling', 'queued', "
-                    "'Queued for voice profiling') RETURNING id"
+                    "'Queued for voice profiling') "
+                    "ON CONFLICT (meeting_id, job_type) WHERE status IN ('queued', 'running') "
+                    "DO NOTHING RETURNING id"
                 ),
                 {"m": meeting_id},
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if created is not None:
+                return str(created)
+            return str(conn.execute(text(
+                "SELECT id FROM meeting_analyzer.processing_jobs WHERE meeting_id=:m "
+                "AND job_type='profiling' AND status IN ('queued','running') "
+                "ORDER BY created_at DESC LIMIT 1"
+            ), {"m": meeting_id}).scalar_one())
 
     # -- analysis -----------------------------------------------------------
 
@@ -398,17 +432,22 @@ class TranscriptionPipeline:
         self._mark_job(job_id, "running", message="Profiling speakers...")
 
         with self._engine.begin() as conn:
-            primary = conn.execute(
-                text(
-                    "SELECT id, segments FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
-                    "AND is_primary = true"
-                ),
-                {"m": meeting_id},
-            ).mappings().one_or_none()
+            primary = (
+                conn.execute(
+                    text(
+                        "SELECT id, segments FROM meeting_analyzer.transcripts WHERE meeting_id = :m "
+                        "AND is_primary = true"
+                    ),
+                    {"m": meeting_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if primary is None:
                 raise SpeakerProfilingError(
                     "This meeting has no primary transcript yet. Transcribe it first."
                 )
+            transcript_id = str(primary["id"])
             segments = list(primary["segments"] or [])
             labeled = [
                 segment
@@ -417,13 +456,17 @@ class TranscriptionPipeline:
                 and isinstance(segment.get("speaker"), str)
                 and segment.get("speaker", "").strip()
             ]
-            file_row = conn.execute(
-                text(
-                    "SELECT lo_oid FROM meeting_analyzer.meeting_files WHERE meeting_id = :m "
-                    "AND kind = 'derived_audio_16k'"
-                ),
-                {"m": meeting_id},
-            ).mappings().one_or_none()
+            file_row = (
+                conn.execute(
+                    text(
+                        "SELECT lo_oid FROM meeting_analyzer.meeting_files WHERE meeting_id = :m "
+                        "AND kind = 'derived_audio_16k'"
+                    ),
+                    {"m": meeting_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
 
         if not labeled:
             self._finish_profiling(
@@ -444,18 +487,30 @@ class TranscriptionPipeline:
         def progress(percent: float, message: str) -> None:
             self._update_progress(job_id, 0.1 + 0.8 * percent, message)
 
-        with tempfile.TemporaryDirectory(prefix="tma-profile-") as temp_dir:
-            audio_path = Path(temp_dir) / "audio-16k-mono.wav"
-            with self._engine.connect() as conn:
-                with open(audio_path, "wb") as target:
-                    lo.copy_lo_to_stream(conn, int(file_row["lo_oid"]), target)
-            stored = self._speaker_profiler.compute_and_store(
-                meeting_id=meeting_id,
-                transcript_id=str(primary["id"]),
-                audio_path=audio_path,
-                segments=segments,
-                progress_cb=progress,
-            )
+        try:
+            with tempfile.TemporaryDirectory(prefix="tma-profile-") as temp_dir:
+                audio_path = Path(temp_dir) / "audio-16k-mono.wav"
+                with self._engine.connect() as conn:
+                    with open(audio_path, "wb") as target:
+                        lo.copy_lo_to_stream(conn, int(file_row["lo_oid"]), target)
+                stored = self._speaker_profiler.compute_and_store(
+                    meeting_id=meeting_id,
+                    transcript_id=transcript_id,
+                    audio_path=audio_path,
+                    segments=segments,
+                    progress_cb=progress,
+                )
+        except SpeakerProfilingError as exc:
+            try:
+                self._speaker_profiler.mark_profiling_error(
+                    meeting_id=meeting_id, transcript_id=transcript_id, error=str(exc)
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist profiling error diagnostics for meeting %s.",
+                    meeting_id,
+                )
+            raise
 
         if not stored:
             self._finish_profiling(
@@ -537,13 +592,18 @@ class TranscriptionPipeline:
                 {"id": job_id},
             ).scalar_one_or_none()
             if status == "failed" and meeting_id:
-                conn.execute(
-                    text(
-                        "UPDATE meeting_analyzer.meetings SET status = 'failed' WHERE id = :m AND "
-                        "status NOT IN ('completed')"
-                    ),
-                    {"m": meeting_id},
-                )
+                job_type = conn.execute(
+                    text("SELECT job_type FROM meeting_analyzer.processing_jobs WHERE id = :id"),
+                    {"id": job_id},
+                ).scalar_one_or_none()
+                if job_type in ("transcription", "analysis"):
+                    conn.execute(
+                        text(
+                            "UPDATE meeting_analyzer.meetings SET status = 'failed' WHERE id = :m AND "
+                            "status NOT IN ('completed')"
+                        ),
+                        {"m": meeting_id},
+                    )
 
 
 def _json(value: Any) -> str:

@@ -57,9 +57,10 @@ FILE_KINDS = AUDIO_KINDS + SOURCE_AUDIO_KINDS + ("attachment",)
 MEETING_STATUSES = ("recording", "recorded", "transcribed", "analyzing", "completed", "failed")
 JOB_TYPES = ("transcription", "analysis", "profiling")
 JOB_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
-# Voice-profile matching states.  'suggested' rows are model output only and
-# must be confirmed by a user before any profile name is displayed.
+# Voice-profile matching states. Clear automatic matches and explicit user
+# decisions are confirmed; uncertain matches may remain suggested or unassigned.
 SPEAKER_ASSIGNMENT_STATUSES = ("suggested", "confirmed", "rejected")
+SPEAKER_ASSIGNMENT_ORIGINS = ("auto", "manual")
 
 # SQL fragment shared by the attachment CHECK constraints: the rules only apply
 # when the row actually is an attachment.
@@ -323,11 +324,10 @@ class ProcessingJob(Base):
 
 
 class SpeakerProfile(Base):
-    """A persistent person identified by voice; named only by users.
+    """A persistent person identified by voice; names originate from users.
 
-    Voice similarity alone never claims an identity: profiles start empty
-    (or as a rename of an unknown meeting speaker) and grow only from
-    embeddings the user explicitly confirmed.
+    Confirmed meeting assignments and explicit enrollment samples contribute
+    reference embeddings to future matching.
     """
 
     __tablename__ = "speaker_profiles"
@@ -340,13 +340,39 @@ class SpeakerProfile(Base):
     )
 
 
+class SpeakerReferenceEmbedding(Base):
+    """An explicitly uploaded reference voice sample for a profile.
+
+    References are the *only* data used to match future meeting speakers.
+    Meeting-derived embeddings never contribute to this table.
+    """
+
+    __tablename__ = "speaker_reference_embeddings"
+    __table_args__ = (
+        Index("ix_speaker_reference_embeddings_profile_id", "profile_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("meeting_analyzer.speaker_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    embedding: Mapped[list] = mapped_column(JSONB, nullable=False)
+    source_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+
 class SpeakerEmbedding(Base):
     """One voice embedding computed from a meeting speaker's segments.
 
     ``embedding`` is a fixed-length float vector stored as JSONB (audio
     itself stays in Large Objects; this is a derived, small numeric array).
-    ``profile_id`` links the embedding to a profile only after the user
-    confirmed the assignment, so confirmed data alone drives future matching.
+    ``profile_id`` links the label to the profile chosen by review, but it is
+    **not** reference data. References live in ``speaker_reference_embeddings``.
     """
 
     __tablename__ = "speaker_embeddings"
@@ -377,6 +403,19 @@ class SpeakerEmbedding(Base):
         ForeignKey("meeting_analyzer.speaker_profiles.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Last calculated matching result (persisted for reloads/observability).
+    best_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("meeting_analyzer.speaker_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    best_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    profiles_evaluated: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    match_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # The diarization label inside the transcript, e.g. "Speaker 0".
     local_label: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list] = mapped_column(JSONB, nullable=False)
@@ -388,9 +427,9 @@ class SpeakerEmbedding(Base):
 class SpeakerAssignment(Base):
     """User-reviewable mapping from a meeting-local speaker to a profile.
 
-    One row per (transcript, local label).  Rows created by automatic
-    matching are ``suggested`` with a similarity ``confidence``; only the
-    user can make them ``confirmed`` (or ``rejected``).
+    One row per (transcript, local label). ``origin`` records whether the row
+    came from automatic matching (``auto``) or a user action (``manual``).
+    Manual confirmed/rejected decisions are preserved across re-profiling.
     """
 
     __tablename__ = "speaker_assignments"
@@ -400,6 +439,12 @@ class SpeakerAssignment(Base):
             + ", ".join(f"'{s}'" for s in SPEAKER_ASSIGNMENT_STATUSES)
             + ")",
             name="status_allowed",
+        ),
+        CheckConstraint(
+            "origin IN ("
+            + ", ".join(f"'{s}'" for s in SPEAKER_ASSIGNMENT_ORIGINS)
+            + ")",
+            name="origin_allowed",
         ),
         Index(
             "uq_speaker_assignments_label",
@@ -431,6 +476,9 @@ class SpeakerAssignment(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="suggested", server_default="suggested"
+    )
+    origin: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="manual", server_default="manual"
     )
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime | None] = mapped_column(

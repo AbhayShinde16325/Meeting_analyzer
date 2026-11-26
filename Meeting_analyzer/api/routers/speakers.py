@@ -22,6 +22,7 @@ from api.schemas import (
     SpeakerProfileCreate,
     SpeakerProfileOut,
     SpeakerProfileRename,
+    SpeakerReferenceOut,
 )
 from services.speaker_profiles import SpeakerProfilingError
 
@@ -119,29 +120,34 @@ def request_profiling(
         raise errors.bad_request(
             "no_transcript", "This meeting has no primary transcript yet."
         )
-    active = conn.execute(
-        text(
-            "SELECT 1 FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
-            "job_type = 'profiling' AND status IN ('queued', 'running')"
-        ),
-        {"m": meeting_id},
-    ).scalar_one_or_none()
+    job_select = (
+        "SELECT id, meeting_id, job_type, status, progress, message, error, provider, model, "
+        "fallback_from, fallback_reason, created_at, started_at, finished_at "
+        "FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
+        "job_type = 'profiling' AND status IN ('queued', 'running') "
+        "ORDER BY created_at DESC LIMIT 1"
+    )
+    active = conn.execute(text(job_select), {"m": meeting_id}).mappings().one_or_none()
     if active is not None:
-        raise errors.ApiError(409, "job_active", "A profiling job is already queued.")
+        return dict(active)
     row = (
         conn.execute(
             text(
                 "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
                 "VALUES (gen_random_uuid(), :m, 'profiling', 'queued', "
-                "'Queued for voice profiling') RETURNING id, meeting_id, job_type, "
+                "'Queued for voice profiling') "
+                "ON CONFLICT (meeting_id, job_type) WHERE status IN ('queued', 'running') "
+                "DO NOTHING RETURNING id, meeting_id, job_type, "
                 "status, progress, message, error, provider, model, fallback_from, "
-                "fallback_reason, created_at, finished_at"
+                "fallback_reason, created_at, started_at, finished_at"
             ),
             {"m": meeting_id},
         )
         .mappings()
-        .one()
+        .one_or_none()
     )
+    if row is None:
+        row = conn.execute(text(job_select), {"m": meeting_id}).mappings().one()
     return dict(row)
 
 
@@ -195,8 +201,9 @@ def enroll_profile(
     profiler: ProfilerDep,
     file: UploadFile = File(...),
 ) -> dict:
-    """ enroll a clean voice sample to a speaker profile."""
+    """Enroll an explicit reference voice sample to a speaker profile."""
     import tempfile
+
     suffix = Path(file.filename or "enrollment.wav").suffix.lower() or ".wav"
     with tempfile.TemporaryDirectory(prefix="tma-enroll-") as td:
         path = Path(td) / f"enroll{suffix}"
@@ -208,6 +215,28 @@ def enroll_profile(
         if size <= 44:
             raise errors.bad_request("empty_audio", "Enrollment audio is empty.")
         try:
-            return profiler.enroll_profile_audio(profile_id=str(profile_id), audio_path=path)
+            return profiler.enroll_profile_audio(
+                profile_id=str(profile_id),
+                audio_path=path,
+                original_filename=file.filename,
+            )
         except SpeakerProfilingError as exc:
             raise _profiling_error(exc) from None
+
+
+@profiles_router.get("/{profile_id}/references", response_model=list[SpeakerReferenceOut])
+def list_profile_references(profile_id: uuid.UUID, profiler: ProfilerDep) -> list[dict]:
+    try:
+        return profiler.list_profile_references(str(profile_id))
+    except SpeakerProfilingError as exc:
+        raise _profiling_error(exc) from None
+
+
+@profiles_router.delete("/{profile_id}/references/{reference_id}", status_code=204)
+def delete_profile_reference(
+    profile_id: uuid.UUID, reference_id: uuid.UUID, profiler: ProfilerDep
+) -> None:
+    try:
+        profiler.delete_profile_reference(str(profile_id), str(reference_id))
+    except SpeakerProfilingError as exc:
+        raise _profiling_error(exc) from None
