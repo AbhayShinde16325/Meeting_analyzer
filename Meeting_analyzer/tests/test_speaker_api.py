@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -395,11 +396,18 @@ class TestAutomaticChaining:
         profiling_jobs = [j for j in jobs if j["job_type"] == "profiling"]
         assert profiling_jobs
         assert profiling_jobs[0]["status"] == "queued"
+        # Exhaust retry budget so this run surfaces terminal failure (retry semantics).
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text("UPDATE meeting_analyzer.processing_jobs SET attempt_count=max_attempts WHERE id=:id"),
+                {"id": profiling_jobs[0]["id"]},
+            )
         api.app.state.pipeline.run_job(profiling_jobs[0]["id"])
         profiling_jobs = [j for j in api.get(f"/meetings/{meeting_id}/jobs").json() if j["job_type"] == "profiling"]
         assert profiling_jobs[0]["status"] == "failed"
         assert "setuptools<81" in profiling_jobs[0]["error"]
-        assert api.get(f"/meetings/{meeting_id}").json()["status"] == "transcribed"
+        # Profiling failure must not fail transcription; downstream analysis may advance status.
+        assert api.get(f"/meetings/{meeting_id}").json()["status"] in {"transcribed", "completed"}
 
 
 class TestMatchingAndReview:
@@ -650,7 +658,8 @@ class TestMatchingAndReview:
         assert spk["decision"] == "no_reference"
         assert spk["reference_available"] is False
         assert spk["reference_count"] == 0
-        assert spk["profiles_evaluated"] == 0
+        assert spk["profiles_evaluated"] == 1
+        assert any(s["profile_id"] == profile["id"] and s["score"] is None for s in spk.get("all_scores", []))
 
         self._enroll_ref(api, profile["id"], "spk-a")
         _run_profiling_job(api, meeting_id)
@@ -721,3 +730,105 @@ class TestMatchingAndReview:
         assert after["status"] == "confirmed"
         assert after["evaluated_at"] is not None
         assert after["evaluated_at"] != before["evaluated_at"]
+
+
+class TestDiagnosticsAndFalsePositiveRegression:
+    def _enroll_ref(self, api, profile_id: str, label: str = "spk-a"):
+        files = {"file": (f"{label}.wav", b"RIFF" + b"\0" * 120, "audio/wav")}
+        resp = api.post(f"/profiles/{profile_id}/enroll", files=files)
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_all_profiles_scored_and_matrix_exposed(self, speaker_api, pg_engine, host_and_meeting):
+        api, meeting_id = host_and_meeting
+        _insert_diarized_transcript(pg_engine, meeting_id)
+        p1 = api.post("/profiles", json={"display_name": "MatA"}).json()
+        p2 = api.post("/profiles", json={"display_name": "MatB"}).json()
+        p3 = api.post("/profiles", json={"display_name": "MatNoRef"}).json()
+        self._enroll_ref(api, p1["id"], "spk-a")
+        self._enroll_ref(api, p2["id"], "spk-b")
+        _run_profiling_job(api, meeting_id)
+
+        spk = _speaker_by_label(api, meeting_id, "spk-a")
+        scores = spk.get("all_scores") or []
+        ids = {s["profile_id"] for s in scores}
+        assert p1["id"] in ids and p2["id"] in ids and p3["id"] in ids
+        by_id = {s["profile_id"]: s for s in scores}
+        assert by_id[p3["id"]]["score"] is None
+        assert by_id[p3["id"]]["has_reference"] is False
+        assert spk["ambiguity_margin"] == 0.05
+        assert spk["decision_reason"]
+        assert spk["second_best_profile_id"] is not None
+        assert spk["score_gap"] is not None
+
+    def test_ambiguous_top_profile_not_assigned_regression(self, speaker_api, pg_engine, host_and_meeting):
+        # spk-c is ~0.707 to both spk-a and spk-b refs: top-two gap within margin => Unknown, no auto assignment.
+        api, meeting_id = host_and_meeting
+        segments = [{"start": 0.0, "end": 10.0, "text": "hello", "speaker": "spk-c"}]
+        with pg_engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO meeting_analyzer.transcripts (id,meeting_id,provider,model,is_primary,text,segments) "
+                "VALUES (gen_random_uuid(),:m,'fake','fake-model',true,'t',CAST(:seg AS jsonb))"
+            ), {"m": meeting_id, "seg": json.dumps(segments)})
+        p_absent = api.post("/profiles", json={"display_name": "AbsentPerson"}).json()
+        p_other = api.post("/profiles", json={"display_name": "OtherPerson"}).json()
+        self._enroll_ref(api, p_absent["id"], "spk-a")
+        self._enroll_ref(api, p_other["id"], "spk-b")
+        _run_profiling_job(api, meeting_id)
+
+        spk = _speaker_by_label(api, meeting_id, "spk-c")
+        assert spk["decision"] == "ambiguous"
+        assert spk["status"] is None
+        assert spk["profile_id"] is None
+        assert spk["profile_name"] is None
+        # Absent profile may be top by score, but must not be assigned.
+        assert spk["best_profile_id"] in (p_absent["id"], p_other["id"])
+        assert spk["best_score"] >= 0.70
+        assert spk["score_gap"] is not None and spk["score_gap"] < 0.05
+
+    def test_invalid_embedding_produces_no_identity_match(self, speaker_api, pg_engine, host_and_meeting, monkeypatch):
+        from services import speaker_profiles as sp_mod
+
+        api, meeting_id = host_and_meeting
+        _insert_diarized_transcript(pg_engine, meeting_id)
+        p = api.post("/profiles", json={"display_name": "ValidRef"}).json()
+        self._enroll_ref(api, p["id"], "spk-a")
+
+        real = api.app.state.speaker_profiler._get_encoder().compute_label_embeddings
+
+        def bad_embeddings(*args, **kwargs):
+            out = real(*args, **kwargs)
+            return [sp_mod.LabelEmbedding(local_label=o.local_label, embedding=[0.0, 0.0, 0.0], source_seconds=o.source_seconds) if o.local_label == "spk-a" else o for o in out]
+
+        monkeypatch.setattr(api.app.state.speaker_profiler._get_encoder(), "compute_label_embeddings", bad_embeddings)
+        _run_profiling_job(api, meeting_id)
+        spk = _speaker_by_label(api, meeting_id, "spk-a")
+        assert spk["decision"] == "error"
+        assert spk["status"] is None
+        assert spk["profile_id"] is None
+        assert "invalid" in (spk.get("decision_reason") or "").lower()
+
+    def test_stale_auto_assignment_recalculated_and_manual_preserved(self, speaker_api, pg_engine, host_and_meeting):
+        api, meeting_id = host_and_meeting
+        _insert_diarized_transcript(pg_engine, meeting_id)
+        p1 = api.post("/profiles", json={"display_name": "OldAuto"}).json()
+        p2 = api.post("/profiles", json={"display_name": "ManualKeep"}).json()
+        self._enroll_ref(api, p1["id"], "spk-a")
+        self._enroll_ref(api, p2["id"], "spk-b")
+        _run_profiling_job(api, meeting_id)
+        # Make spk-a stale/wrong auto assignment in DB, then reprofiling should fix it.
+        with pg_engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE meeting_analyzer.speaker_assignments SET profile_id=:p, status='confirmed', origin='auto' "
+                "WHERE transcript_id=(SELECT id FROM meeting_analyzer.transcripts WHERE meeting_id=:m AND is_primary=true) AND local_label='spk-a'"
+            ), {"p": p2["id"], "m": meeting_id})
+        # Manual assignment on spk-b should be preserved.
+        api.post(f"/meetings/{meeting_id}/speakers/spk-b/assign", json={"profile_id": p1["id"], "status": "confirmed"})
+        _run_profiling_job(api, meeting_id)
+
+        spk_a = _speaker_by_label(api, meeting_id, "spk-a")
+        assert spk_a["origin"] == "auto"
+        assert spk_a["profile_id"] == p1["id"]
+        spk_b = _speaker_by_label(api, meeting_id, "spk-b")
+        assert spk_b["origin"] == "manual"
+        assert spk_b["profile_id"] == p1["id"]

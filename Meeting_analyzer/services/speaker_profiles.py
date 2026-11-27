@@ -401,12 +401,22 @@ class SpeakerProfileService:
             return []
 
         centroids = self._profile_centroids()
-        profile_count = len(centroids)
+        all_profiles = self.list_profiles()
+        profile_count = len(all_profiles)
         threshold = float(self._settings.voice_match_threshold)
         ambiguity_margin = float(self._settings.voice_match_ambiguity_margin)
         eval_time = _now_sql(self._engine)
 
         embedded_by_label = {item.local_label: item for item in label_embeddings}
+        # Detect accidental embedding reuse across different diarized labels.
+        reused_labels: dict[str, list[str]] = {}
+        labels_sorted = sorted(embedded_by_label)
+        for i, la in enumerate(labels_sorted):
+            for lb in labels_sorted[i + 1 :]:
+                if cosine_similarity(embedded_by_label[la].embedding, embedded_by_label[lb].embedding) >= 0.9999:
+                    reused_labels.setdefault(la, []).append(lb)
+                    reused_labels.setdefault(lb, []).append(la)
+
         with self._engine.begin() as conn:
             for label in sorted(diarized_labels):
                 item = embedded_by_label.get(label)
@@ -440,13 +450,62 @@ class SpeakerProfileService:
                         )
                     continue
 
-                ranked = self._rank_profiles(item.embedding, centroids)
+                # Build full score matrix against every saved profile.
+                all_scores: list[dict[str, Any]] = []
+                ranked: list[MatchCandidate] = []
+                for prof in all_profiles:
+                    pid = str(prof["id"])
+                    pname = str(prof.get("display_name") or "")
+                    centroid = centroids.get(pid)
+                    if centroid is None:
+                        all_scores.append(
+                            {
+                                "profile_id": pid,
+                                "profile_name": pname,
+                                "score": None,
+                                "has_reference": False,
+                            }
+                        )
+                        continue
+                    score = cosine_similarity(item.embedding, centroid)
+                    all_scores.append(
+                        {
+                            "profile_id": pid,
+                            "profile_name": pname,
+                            "score": round(float(score), 6),
+                            "has_reference": True,
+                        }
+                    )
+                    ranked.append(MatchCandidate(profile_id=pid, profile_name=pname, confidence=float(score)))
+                ranked.sort(key=lambda c: c.confidence, reverse=True)
+                all_scores.sort(key=lambda s: (s["score"] is None, -(s["score"] or 0.0), s["profile_name"]))
+
                 best = ranked[0] if ranked else None
                 second = ranked[1] if len(ranked) > 1 else None
                 best_score = float(best.confidence) if best else None
+                second_score = float(second.confidence) if second else None
                 best_profile_id = str(best.profile_id) if best else None
-                decision = self._decision(best_score, second.confidence if second else None, profile_count, threshold, ambiguity_margin)
-                match_profile_id = best_profile_id if decision == "matched" else None
+                second_best_profile_id = str(second.profile_id) if second else None
+                score_gap = round(best_score - second_score, 10) if best_score is not None and second_score is not None else None
+
+                # Reliability guard: invalid/reused embeddings must not auto-match.
+                norm = float(np.linalg.norm(np.asarray(item.embedding, dtype=np.float64)))
+                unreliable_reason = None
+                if not np.isfinite(norm) or norm <= 1e-8:
+                    unreliable_reason = "Speaker embedding is invalid (zero/NaN norm); no identity match assigned."
+                elif label in reused_labels:
+                    dupes = ", ".join(reused_labels[label])
+                    unreliable_reason = f"Speaker embedding is identical to another diarized label ({dupes}); possible diarization/embedding reuse. No identity match assigned."
+
+                if unreliable_reason:
+                    decision = "error"
+                    decision_reason = unreliable_reason
+                    match_profile_id = None
+                else:
+                    decision, decision_reason = self._decision_detail(
+                        best_score, second_score, len(ranked), threshold, ambiguity_margin
+                    )
+                    match_profile_id = best_profile_id if decision == "matched" else None
 
                 # Preserve profile link for manually locked confirmed assignments.
                 profile_link = (
@@ -460,13 +519,17 @@ class SpeakerProfileService:
                     text(
                         "INSERT INTO meeting_analyzer.speaker_embeddings "
                         "(id, meeting_id, transcript_id, local_label, embedding, source_seconds, profile_id, "
-                        " best_profile_id, best_score, decision, profiles_evaluated, match_threshold, evaluated_at) "
+                        " best_profile_id, best_score, second_best_profile_id, second_best_score, score_gap, "
+                        " ambiguity_margin_used, decision, decision_reason, profiles_evaluated, match_threshold, all_scores, evaluated_at) "
                         "VALUES (gen_random_uuid(), :m, :t, :label, CAST(:embedding AS jsonb), :seconds, :profile, "
-                        " :best_profile, :best_score, :decision, :profiles_evaluated, :match_threshold, :evaluated_at) "
+                        " :best_profile, :best_score, :second_best_profile, :second_best_score, :score_gap, "
+                        " :ambiguity_margin, :decision, :decision_reason, :profiles_evaluated, :match_threshold, CAST(:all_scores AS jsonb), :evaluated_at) "
                         "ON CONFLICT (transcript_id, local_label) DO UPDATE SET "
                         "embedding=EXCLUDED.embedding, source_seconds=EXCLUDED.source_seconds, profile_id=EXCLUDED.profile_id, "
-                        "best_profile_id=EXCLUDED.best_profile_id, best_score=EXCLUDED.best_score, decision=EXCLUDED.decision, "
-                        "profiles_evaluated=EXCLUDED.profiles_evaluated, match_threshold=EXCLUDED.match_threshold, evaluated_at=EXCLUDED.evaluated_at"
+                        "best_profile_id=EXCLUDED.best_profile_id, best_score=EXCLUDED.best_score, "
+                        "second_best_profile_id=EXCLUDED.second_best_profile_id, second_best_score=EXCLUDED.second_best_score, score_gap=EXCLUDED.score_gap, "
+                        "ambiguity_margin_used=EXCLUDED.ambiguity_margin_used, decision=EXCLUDED.decision, decision_reason=EXCLUDED.decision_reason, "
+                        "profiles_evaluated=EXCLUDED.profiles_evaluated, match_threshold=EXCLUDED.match_threshold, all_scores=EXCLUDED.all_scores, evaluated_at=EXCLUDED.evaluated_at"
                     ),
                     {
                         "m": meeting_id,
@@ -477,9 +540,15 @@ class SpeakerProfileService:
                         "profile": profile_link,
                         "best_profile": best_profile_id,
                         "best_score": best_score,
+                        "second_best_profile": second_best_profile_id,
+                        "second_best_score": second_score,
+                        "score_gap": score_gap,
+                        "ambiguity_margin": ambiguity_margin,
                         "decision": decision,
+                        "decision_reason": decision_reason,
                         "profiles_evaluated": profile_count,
                         "match_threshold": threshold,
+                        "all_scores": _json(all_scores),
                         "evaluated_at": eval_time,
                     },
                 )
@@ -518,6 +587,34 @@ class SpeakerProfileService:
         return label_embeddings
 
     @staticmethod
+    def _decision_detail(
+        best_score: float | None,
+        second_score: float | None,
+        profile_count: int,
+        threshold: float,
+        ambiguity_margin: float,
+    ) -> tuple[str, str]:
+        if profile_count <= 0:
+            return "no_reference", "No reference embeddings are available for any profile."
+        if best_score is None:
+            return "below_threshold", "No valid similarity score was produced."
+        if best_score < threshold:
+            pct = round(best_score * 100, 2)
+            thr = round(threshold * 100, 2)
+            return "below_threshold", f"Best similarity {pct}% is below threshold {thr}%."
+        gap = round(best_score - second_score, 10) if second_score is not None else None
+        if second_score is not None and gap is not None and gap < ambiguity_margin:
+            return (
+                "ambiguous",
+                f"Top two profiles are within ambiguity margin ({gap:.4f} < {ambiguity_margin:.4f}); speaker left Unknown.",
+            )
+        pct = round(best_score * 100, 2)
+        thr = round(threshold * 100, 2)
+        if gap is None:
+            return "matched", f"Best similarity {pct}% meets threshold {thr}% with no competing profile."
+        return "matched", f"Best similarity {pct}% meets threshold {thr}% with gap {gap:.4f}."
+
+    @staticmethod
     def _decision(
         best_score: float | None,
         second_score: float | None,
@@ -525,20 +622,10 @@ class SpeakerProfileService:
         threshold: float,
         ambiguity_margin: float,
     ) -> str:
-        if profile_count <= 0:
-            return "no_reference"
-        if best_score is None:
-            return "below_threshold"
-        if best_score < threshold:
-            return "below_threshold"
-        # best_score >= threshold
-        if (
-            second_score is not None
-            and second_score >= threshold
-            and round(best_score - second_score, 10) < ambiguity_margin
-        ):
-            return "ambiguous"
-        return "matched"
+        decision, _ = SpeakerProfileService._decision_detail(
+            best_score, second_score, profile_count, threshold, ambiguity_margin
+        )
+        return decision
 
     def _profile_centroids(self) -> dict[str, list[float]]:
         """Mean explicit reference embeddings per profile. References only."""
@@ -642,7 +729,8 @@ class SpeakerProfileService:
                 for row in conn.execute(
                     text(
                         "SELECT id, local_label, embedding, source_seconds, profile_id, "
-                        "best_profile_id, best_score, decision, profiles_evaluated, match_threshold, evaluated_at "
+                        "best_profile_id, best_score, second_best_profile_id, second_best_score, score_gap, "
+                        "ambiguity_margin_used, decision, decision_reason, profiles_evaluated, match_threshold, all_scores, evaluated_at "
                         "FROM meeting_analyzer.speaker_embeddings WHERE transcript_id = :t"
                     ),
                     {"t": transcript["id"]},
@@ -698,8 +786,38 @@ class SpeakerProfileService:
             emb = embeddings.get(label)
             assignment = assignments.get(label)
             embedding_vector = list(emb["embedding"]) if emb is not None else None
+            ambiguity_margin = float(self._settings.voice_match_ambiguity_margin)
+            all_scores: list[dict[str, Any]] = []
+            if emb is not None and emb.get("all_scores"):
+                raw_scores = emb.get("all_scores")
+                if isinstance(raw_scores, list):
+                    all_scores = raw_scores
+            if not all_scores and embedding_vector is not None:
+                for prof in profiles:
+                    pid = str(prof["id"])
+                    pname = str(prof.get("display_name") or "")
+                    centroid = centroids.get(pid)
+                    if centroid is None:
+                        all_scores.append({"profile_id": pid, "profile_name": pname, "score": None, "has_reference": False})
+                    else:
+                        all_scores.append({"profile_id": pid, "profile_name": pname, "score": round(cosine_similarity(embedding_vector, centroid), 6), "has_reference": True})
+                all_scores.sort(key=lambda s: (s["score"] is None, -(s["score"] or 0.0), s["profile_name"]))
+
             candidates: list[dict[str, Any]] = []
-            if embedding_vector is not None:
+            for row_score in all_scores:
+                score = row_score.get("score")
+                if score is None:
+                    continue
+                if float(score) >= float(self._settings.voice_review_threshold):
+                    candidates.append(
+                        {
+                            "profile_id": str(row_score["profile_id"]),
+                            "display_name": str(row_score.get("profile_name") or ""),
+                            "confidence": round(float(score), 4),
+                        }
+                    )
+            if not candidates and embedding_vector is not None:
+                # Fallback for old rows without all_scores.
                 for cand in self._match(
                     embedding_vector, centroids, self._settings.voice_review_threshold
                 ):
@@ -710,6 +828,7 @@ class SpeakerProfileService:
                             "confidence": round(cand.confidence, 4),
                         }
                     )
+
             profile_id = (
                 str(assignment["profile_id"])
                 if assignment is not None and assignment["profile_id"] is not None
@@ -720,17 +839,37 @@ class SpeakerProfileService:
                 if emb is not None and emb.get("best_profile_id") is not None
                 else (candidates[0]["profile_id"] if candidates else None)
             )
+            second_best_profile_id = (
+                str(emb["second_best_profile_id"])
+                if emb is not None and emb.get("second_best_profile_id") is not None
+                else (str(all_scores[1]["profile_id"]) if len(all_scores) > 1 and all_scores[1].get("score") is not None else None)
+            )
             best_score = (
                 float(emb["best_score"])
                 if emb is not None and emb.get("best_score") is not None
                 else (float(candidates[0]["confidence"]) if candidates else None)
             )
+            second_best_score = (
+                float(emb["second_best_score"])
+                if emb is not None and emb.get("second_best_score") is not None
+                else (float(all_scores[1]["score"]) if len(all_scores) > 1 and all_scores[1].get("score") is not None else None)
+            )
+            score_gap = (
+                float(emb["score_gap"])
+                if emb is not None and emb.get("score_gap") is not None
+                else (round(best_score - second_best_score, 10) if best_score is not None and second_best_score is not None else None)
+            )
             decision = str(emb["decision"]) if emb is not None and emb.get("decision") else None
+            decision_reason = str(emb["decision_reason"]) if emb is not None and emb.get("decision_reason") else None
             if decision is None:
                 if emb is None:
                     decision = "error" if job_status == "failed" else "no_embedding"
+                    decision_reason = job_error or "No meeting embedding has been computed for this speaker."
                 elif not reference_available:
                     decision = "no_reference"
+                    decision_reason = "No reference embeddings are available for any profile."
+                else:
+                    decision_reason = decision_reason or "No decision reason recorded."
 
             speakers.append(
                 {
@@ -753,22 +892,33 @@ class SpeakerProfileService:
                     "status": str(assignment["status"]) if assignment is not None else None,
                     "origin": str(assignment["origin"]) if assignment is not None and assignment.get("origin") else None,
                     "candidates": candidates,
+                    "all_scores": all_scores,
                     "same_voice_labels": same_voice.get(label, []),
                     "reference_available": reference_available,
                     "reference_count": sum(profile_ref_counts.values()),
                     "best_profile_id": best_profile_id,
                     "best_profile_name": profile_names.get(best_profile_id) if best_profile_id else None,
                     "best_score": round(best_score, 4) if best_score is not None else None,
+                    "second_best_profile_id": second_best_profile_id,
+                    "second_best_profile_name": profile_names.get(second_best_profile_id) if second_best_profile_id else None,
+                    "second_best_score": round(second_best_score, 4) if second_best_score is not None else None,
+                    "score_gap": round(score_gap, 4) if score_gap is not None else None,
+                    "ambiguity_margin": (
+                        round(float(emb["ambiguity_margin_used"]), 4)
+                        if emb is not None and emb.get("ambiguity_margin_used") is not None
+                        else round(ambiguity_margin, 4)
+                    ),
                     "threshold": (
                         round(float(emb["match_threshold"]), 4)
                         if emb is not None and emb.get("match_threshold") is not None
                         else None
                     ),
                     "decision": decision,
+                    "decision_reason": decision_reason,
                     "profiles_evaluated": (
                         int(emb["profiles_evaluated"])
                         if emb is not None and emb.get("profiles_evaluated") is not None
-                        else (len(centroids) if emb is not None else None)
+                        else (len(profiles) if emb is not None else None)
                     ),
                     "evaluated_at": emb.get("evaluated_at") if emb is not None else None,
                     "job_status": job_status,
@@ -998,11 +1148,107 @@ class SpeakerProfileService:
         if result.rowcount == 0:
             raise SpeakerProfilingError("Speaker profile not found.")
 
+    def audit_reference_embeddings(self) -> dict[str, Any]:
+        """Audit reference embeddings for ownership/integrity issues.
+
+        Read-only. Does not modify or delete data. Reports affected profiles and
+        a safe repair path (re-enroll or delete specific bad reference samples).
+        """
+        issues: list[dict[str, Any]] = []
+        with self._engine.connect() as conn:
+            refs = conn.execute(
+                text(
+                    "SELECT r.id, r.profile_id, r.embedding, r.source_seconds, r.original_filename, r.provider, r.model, r.created_at, "
+                    "p.display_name "
+                    "FROM meeting_analyzer.speaker_reference_embeddings r "
+                    "LEFT JOIN meeting_analyzer.speaker_profiles p ON p.id = r.profile_id "
+                    "ORDER BY r.created_at DESC"
+                )
+            ).mappings().all()
+            meeting_embedding_count = int(
+                conn.execute(text("SELECT COUNT(*) FROM meeting_analyzer.speaker_embeddings")).scalar_one()
+            )
+
+        vectors: list[tuple[str, str, list[float]]] = []
+        for r in refs:
+            rid = str(r["id"])
+            pid = str(r["profile_id"]) if r["profile_id"] is not None else None
+            pname = r.get("display_name")
+            emb = r.get("embedding")
+            problems: list[str] = []
+            if pid is None:
+                problems.append("missing_profile_id")
+            if pname is None:
+                problems.append("profile_missing")
+            if not isinstance(emb, list) or len(emb) == 0:
+                problems.append("missing_or_empty_embedding")
+                emb_vec = None
+            else:
+                try:
+                    emb_vec = [float(x) for x in emb]
+                    norm = float(np.linalg.norm(np.asarray(emb_vec, dtype=np.float64)))
+                    if not np.isfinite(norm) or norm <= 1e-8:
+                        problems.append("invalid_zero_or_nan_embedding")
+                    else:
+                        vectors.append((rid, pid or "", emb_vec))
+                except Exception:
+                    problems.append("invalid_embedding_values")
+                    emb_vec = None
+            sec = r.get("source_seconds")
+            if sec is not None and float(sec) <= 0:
+                problems.append("non_positive_source_seconds")
+            if problems:
+                issues.append(
+                    {
+                        "reference_id": rid,
+                        "profile_id": pid,
+                        "profile_name": pname,
+                        "original_filename": r.get("original_filename"),
+                        "provider": r.get("provider"),
+                        "model": r.get("model"),
+                        "created_at": r.get("created_at"),
+                        "issues": problems,
+                        "repair": "Delete the affected reference sample and re-enroll a clean explicit reference audio for the correct profile.",
+                    }
+                )
+
+        # Duplicate detection (exact or near-identical vectors).
+        seen: dict[str, str] = {}
+        for rid, pid, vec in vectors:
+            key = json.dumps([round(v, 6) for v in vec], separators=(",", ":"))
+            if key in seen:
+                issues.append(
+                    {
+                        "reference_id": rid,
+                        "profile_id": pid,
+                        "duplicate_of_reference_id": seen[key],
+                        "issues": ["duplicate_embedding_vector"],
+                        "repair": "Review both samples; delete the incorrect/duplicate reference sample. Do not delete if uncertain.",
+                    }
+                )
+            else:
+                seen[key] = rid
+
+        affected_profiles = sorted({str(i.get("profile_id")) for i in issues if i.get("profile_id")})
+        return {
+            "ok": len(issues) == 0,
+            "reference_count": len(refs),
+            "meeting_embedding_count": meeting_embedding_count,
+            "affected_profile_ids": affected_profiles,
+            "issues": issues,
+            "repair_guidance": (
+                "No reference data was modified. For affected profiles, verify the original audio sample belongs to the named person; "
+                "delete incorrect reference samples via DELETE /profiles/{profile_id}/references/{reference_id} and re-enroll correct audio. "
+                "Meeting-derived embeddings are never reference data and were not modified."
+            ),
+        }
+
     def mark_profiling_error(self, *, meeting_id: str, transcript_id: str, error: str) -> None:
         """Persist `error` decision for diarized labels when profiling fails."""
 
         eval_time = _now_sql(self._engine)
         threshold = float(self._settings.voice_match_threshold)
+        ambiguity_margin = float(self._settings.voice_match_ambiguity_margin)
         with self._engine.begin() as conn:
             labels = _diarized_labels(conn, transcript_id)
             profiles_evaluated = conn.execute(
@@ -1014,14 +1260,16 @@ class SpeakerProfileService:
                 conn.execute(
                     text(
                         "UPDATE meeting_analyzer.speaker_embeddings SET "
-                        "decision='error', profiles_evaluated=:pe, match_threshold=:mt, evaluated_at=:ea "
+                        "decision='error', decision_reason=:reason, profiles_evaluated=:pe, match_threshold=:mt, ambiguity_margin_used=:am, evaluated_at=:ea "
                         "WHERE transcript_id=:t AND local_label=:label"
                     ),
                     {
                         "t": transcript_id,
                         "label": label,
+                        "reason": f"Profiling failed: {error}",
                         "pe": int(profiles_evaluated),
                         "mt": threshold,
+                        "am": ambiguity_margin,
                         "ea": eval_time,
                     },
                 )

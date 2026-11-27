@@ -82,7 +82,7 @@ def list_meeting_files(meeting_id: uuid.UUID, conn: ConnDep) -> list[dict]:
         conn.execute(
             text(
                 "SELECT id, meeting_id, kind, sha256, size_bytes, mime_type, "
-                "original_filename, duration_ms, sample_rate, channels, created_at "
+                "original_filename, duration_ms, sample_rate, channels, codec, bitrate_kbps, container, created_at "
                 "FROM meeting_analyzer.meeting_files WHERE meeting_id = :m ORDER BY created_at"
             ),
             {"m": meeting_id},
@@ -127,7 +127,7 @@ def upload_attachment(
                 "size_bytes, mime_type, original_filename) VALUES "
                 "(gen_random_uuid(), :m, 'attachment', :oid, :sha, :size, :mime, :name) "
                 "RETURNING id, meeting_id, kind, sha256, size_bytes, mime_type, "
-                "original_filename, duration_ms, sample_rate, channels, created_at"
+                "original_filename, duration_ms, sample_rate, channels, codec, bitrate_kbps, container, created_at"
             ),
             {"m": meeting_id, "oid": oid, "sha": sha256, "size": size,
              "mime": mime_type, "name": filename},

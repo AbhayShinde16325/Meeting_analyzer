@@ -39,8 +39,9 @@ class TestMetricsPersistence:
         assert row is not None
         metrics = row["metrics"]
         # Measured metrics from the fake provider's single (unlabelled)
-        # 1-second segment over a 0.1 s meeting duration.
-        assert metrics["audio_duration_s"] == 0.1
+        # 1-second segment over a 0.1 s meeting duration. Opus containerization
+        # can introduce small duration rounding vs raw WAV.
+        assert metrics["audio_duration_s"] == pytest.approx(0.1, abs=0.02)
         assert metrics["transcription_duration_s"] >= 0.0
         assert metrics["rtf"] is None or metrics["rtf"] > 0
         assert metrics["num_speakers"] is None

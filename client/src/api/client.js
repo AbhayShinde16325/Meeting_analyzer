@@ -173,6 +173,7 @@ export const api = {
   transcribe: (meetingId) => request(`/meetings/${meetingId}/transcribe`, { method: 'POST' }),
   analyse: (meetingId) => request(`/meetings/${meetingId}/analyse`, { method: 'POST' }),
   cancelJob: (meetingId, jobId) => request(`/meetings/${meetingId}/jobs/${jobId}/cancel`, { method: 'POST' }),
+  requeueJob: (meetingId, jobId) => request(`/meetings/${meetingId}/jobs/${jobId}/requeue`, { method: 'POST' }),
   exportMeeting: (meetingId) => download(`/meetings/${meetingId}/export?include_audio=true`, `meeting-${meetingId}.zip`),
   audioUrl: (fileId) => `${API_BASE}/files/${fileId}`,
 }

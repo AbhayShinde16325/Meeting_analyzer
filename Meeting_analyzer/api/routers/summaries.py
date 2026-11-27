@@ -70,29 +70,38 @@ def analyse(
             "analysis_not_configured",
             "No analysis backend configured. Set TEAMMEETINGAI_ANALYSIS_BACKEND=groq, TEAMMEETINGAI_ALLOW_CLOUD_ANALYSIS=1, TEAMMEETINGAI_GROQ_MODEL, and TEAMMEETINGAI_GROQ_API_KEY.",
         )
+    job_fields = """
+        id, meeting_id, job_type, status, progress, message, error, error_code, error_detail,
+        provider, model, fallback_from, fallback_reason, attempt_count, max_attempts,
+        next_run_at, heartbeat_at, cancel_requested_at, created_at, started_at, finished_at, updated_at
+    """
     active = conn.execute(
         text(
             "SELECT 1 FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
-            "job_type = 'analysis' AND status IN ('queued', 'running')"
+            "job_type = 'analysis' AND status IN ('queued', 'running', 'cancelling')"
         ),
         {"m": meeting_id},
     ).scalar_one_or_none()
     if active is not None:
-        raise errors.ApiError(409, "job_active", "An analysis job is already queued.")
+        raise errors.conflict("job_active", "An analysis job is already active.")
     row = (
         conn.execute(
             text(
-                "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, "
-                "message) VALUES (gen_random_uuid(), :m, 'analysis', 'queued', "
-                "'Queued for analysis') RETURNING id, meeting_id, job_type, status, "
-                "progress, message, error, provider, model, fallback_from, "
-                "fallback_reason, created_at, finished_at"
+                f"""
+                INSERT INTO meeting_analyzer.processing_jobs (
+                    id, meeting_id, job_type, status, message, attempt_count, max_attempts, heartbeat_at, updated_at
+                ) VALUES (gen_random_uuid(), :m, 'analysis', 'queued', 'Queued for analysis', 0, 3, now(), now())
+                ON CONFLICT (meeting_id, job_type) WHERE status IN ('queued', 'running', 'cancelling')
+                DO NOTHING RETURNING {job_fields}
+                """
             ),
             {"m": meeting_id},
         )
         .mappings()
-        .one()
+        .one_or_none()
     )
+    if row is None:
+        raise errors.conflict("job_active", "An analysis job is already active.")
     return dict(row)
 
 

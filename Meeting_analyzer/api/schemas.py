@@ -51,6 +51,9 @@ class MeetingFileOut(BaseModel):
     duration_ms: int | None = None
     sample_rate: int | None = None
     channels: int | None = None
+    codec: str | None = None
+    bitrate_kbps: int | None = None
+    container: str | None = None
     created_at: datetime
 
 
@@ -105,13 +108,21 @@ class JobOut(BaseModel):
     progress: float
     message: str | None = None
     error: str | None = None
+    error_code: str | None = None
+    error_detail: dict[str, Any] | None = None
     provider: str | None = None
     model: str | None = None
     fallback_from: str | None = None
     fallback_reason: str | None = None
+    attempt_count: int = 0
+    max_attempts: int = 3
+    next_run_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    cancel_requested_at: datetime | None = None
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class SearchHit(BaseModel):
@@ -151,6 +162,13 @@ class SpeakerCandidate(BaseModel):
     confidence: float
 
 
+class SpeakerScoreOut(BaseModel):
+    profile_id: uuid.UUID
+    profile_name: str
+    score: float | None = None
+    has_reference: bool = True
+
+
 class MeetingSpeakerOut(BaseModel):
     """One meeting-local diarized label with its review/matching state."""
 
@@ -165,6 +183,7 @@ class MeetingSpeakerOut(BaseModel):
     status: str | None = None
     origin: str | None = None
     candidates: list[SpeakerCandidate] = Field(default_factory=list)
+    all_scores: list[SpeakerScoreOut] = Field(default_factory=list)
     # Other labels in this meeting whose voice print is near-identical.
     same_voice_labels: list[str] = Field(default_factory=list)
     reference_available: bool = False
@@ -172,8 +191,14 @@ class MeetingSpeakerOut(BaseModel):
     best_profile_id: uuid.UUID | None = None
     best_profile_name: str | None = None
     best_score: float | None = None
+    second_best_profile_id: uuid.UUID | None = None
+    second_best_profile_name: str | None = None
+    second_best_score: float | None = None
+    score_gap: float | None = None
+    ambiguity_margin: float | None = None
     threshold: float | None = None
     decision: str | None = None
+    decision_reason: str | None = None
     profiles_evaluated: int | None = None
     evaluated_at: datetime | None = None
     job_status: str | None = None

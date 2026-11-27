@@ -47,38 +47,50 @@ def transcribe(
     """(Re-)queue transcription (Sarvam primary, Whisper fallback)."""
 
     _meeting_exists(conn, meeting_id)
-    original = conn.execute(
+    audio = conn.execute(
         text(
-            "SELECT 1 FROM meeting_analyzer.meeting_files WHERE meeting_id = :m AND "
-            "kind = 'original_audio_48k'"
+            """
+            SELECT 1 FROM meeting_analyzer.meeting_files
+            WHERE meeting_id = :m AND kind IN ('audio_opus', 'derived_audio_16k', 'original_audio_48k')
+            LIMIT 1
+            """
         ),
         {"m": meeting_id},
     ).scalar_one_or_none()
-    if original is None:
+    if audio is None:
         raise errors.bad_request(
             "no_audio", "This meeting has no stored audio to transcribe."
         )
+    job_fields = """
+        id, meeting_id, job_type, status, progress, message, error, error_code, error_detail,
+        provider, model, fallback_from, fallback_reason, attempt_count, max_attempts,
+        next_run_at, heartbeat_at, cancel_requested_at, created_at, started_at, finished_at, updated_at
+    """
     active = conn.execute(
         text(
             "SELECT 1 FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
-            "job_type = 'transcription' AND status IN ('queued', 'running')"
+            "job_type = 'transcription' AND status IN ('queued', 'running', 'cancelling')"
         ),
         {"m": meeting_id},
     ).scalar_one_or_none()
     if active is not None:
-        raise errors.ApiError(409, "job_active", "A transcription job is already queued.")
+        raise errors.conflict("job_active", "A transcription job is already active.")
     row = (
         conn.execute(
             text(
-                "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
-                "VALUES (gen_random_uuid(), :m, 'transcription', 'queued', "
-                "'Queued for transcription') RETURNING id, meeting_id, job_type, "
-                "status, progress, message, error, provider, model, fallback_from, "
-                "fallback_reason, created_at, finished_at"
+                f"""
+                INSERT INTO meeting_analyzer.processing_jobs (
+                    id, meeting_id, job_type, status, message, attempt_count, max_attempts, heartbeat_at, updated_at
+                ) VALUES (gen_random_uuid(), :m, 'transcription', 'queued', 'Queued for transcription', 0, 3, now(), now())
+                ON CONFLICT (meeting_id, job_type) WHERE status IN ('queued', 'running', 'cancelling')
+                DO NOTHING RETURNING {job_fields}
+                """
             ),
             {"m": meeting_id},
         )
         .mappings()
-        .one()
+        .one_or_none()
     )
+    if row is None:
+        raise errors.conflict("job_active", "A transcription job is already active.")
     return dict(row)

@@ -120,11 +120,14 @@ def request_profiling(
         raise errors.bad_request(
             "no_transcript", "This meeting has no primary transcript yet."
         )
+    job_fields = """
+        id, meeting_id, job_type, status, progress, message, error, error_code, error_detail,
+        provider, model, fallback_from, fallback_reason, attempt_count, max_attempts,
+        next_run_at, heartbeat_at, cancel_requested_at, created_at, started_at, finished_at, updated_at
+    """
     job_select = (
-        "SELECT id, meeting_id, job_type, status, progress, message, error, provider, model, "
-        "fallback_from, fallback_reason, created_at, started_at, finished_at "
-        "FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
-        "job_type = 'profiling' AND status IN ('queued', 'running') "
+        f"SELECT {job_fields} FROM meeting_analyzer.processing_jobs WHERE meeting_id = :m AND "
+        "job_type = 'profiling' AND status IN ('queued', 'running', 'cancelling') "
         "ORDER BY created_at DESC LIMIT 1"
     )
     active = conn.execute(text(job_select), {"m": meeting_id}).mappings().one_or_none()
@@ -133,13 +136,13 @@ def request_profiling(
     row = (
         conn.execute(
             text(
-                "INSERT INTO meeting_analyzer.processing_jobs (id, meeting_id, job_type, status, message) "
-                "VALUES (gen_random_uuid(), :m, 'profiling', 'queued', "
-                "'Queued for voice profiling') "
-                "ON CONFLICT (meeting_id, job_type) WHERE status IN ('queued', 'running') "
-                "DO NOTHING RETURNING id, meeting_id, job_type, "
-                "status, progress, message, error, provider, model, fallback_from, "
-                "fallback_reason, created_at, started_at, finished_at"
+                f"""
+                INSERT INTO meeting_analyzer.processing_jobs (
+                    id, meeting_id, job_type, status, message, attempt_count, max_attempts, heartbeat_at, updated_at
+                ) VALUES (gen_random_uuid(), :m, 'profiling', 'queued', 'Queued for voice profiling', 0, 3, now(), now())
+                ON CONFLICT (meeting_id, job_type) WHERE status IN ('queued', 'running', 'cancelling')
+                DO NOTHING RETURNING {job_fields}
+                """
             ),
             {"m": meeting_id},
         )
@@ -147,13 +150,21 @@ def request_profiling(
         .one_or_none()
     )
     if row is None:
-        row = conn.execute(text(job_select), {"m": meeting_id}).mappings().one()
+        row = conn.execute(text(job_select), {"m": meeting_id}).mappings().one_or_none()
+        if row is None:
+            raise errors.conflict("job_active", "A profiling job is already active.")
     return dict(row)
 
 
 @profiles_router.get("", response_model=list[SpeakerProfileOut])
 def list_profiles(profiler: ProfilerDep) -> list[dict]:
     return profiler.list_profiles()
+
+
+@profiles_router.get("/reference-audit")
+def audit_reference_embeddings(profiler: ProfilerDep) -> dict:
+    """Read-only audit of reference embedding ownership/integrity."""
+    return profiler.audit_reference_embeddings()
 
 
 @profiles_router.post("", response_model=SpeakerProfileOut, status_code=201)
@@ -204,9 +215,11 @@ def enroll_profile(
     """Enroll an explicit reference voice sample to a speaker profile."""
     import tempfile
 
-    suffix = Path(file.filename or "enrollment.wav").suffix.lower() or ".wav"
+    original_name = Path(file.filename or "enroll.wav").name
+    suffix = Path(original_name).suffix.lower() or ".wav"
+    safe_name = f"enroll-{original_name}" if original_name else f"enroll{suffix}"
     with tempfile.TemporaryDirectory(prefix="tma-enroll-") as td:
-        path = Path(td) / f"enroll{suffix}"
+        path = Path(td) / safe_name
         size = 0
         with open(path, "wb") as out:
             while chunk := file.file.read(1024 * 1024):

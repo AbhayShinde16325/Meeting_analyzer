@@ -5,8 +5,10 @@ Design rules (from the architecture decision):
 * Binary content lives in PostgreSQL **Large Objects**; this table set stores
   only the LO OID plus metadata (SHA-256, size, MIME type, audio properties).
   Recording files are never BYTEA and never on the filesystem library.
-* ``meeting_files.kind`` distinguishes the original 48 kHz WAV, the derived
-  16 kHz mono WAV, and attachments.
+* ``meeting_files.kind`` distinguishes legacy WAV artifacts
+  (``original_audio_48k``, ``derived_audio_16k``), the canonical compressed
+  Opus artifact for new recordings (``audio_opus``), source/mixed tracks, and
+  attachments.
 * Exactly one ``is_primary`` transcript per meeting is enforced with a partial
   unique index (summaries and chat answers always read the primary).
 * Deletion is hard delete: FK cascades plus a ``BEFORE DELETE`` trigger that
@@ -52,11 +54,12 @@ ATTACHMENT_MIME_TYPES = (
 )
 
 AUDIO_KINDS = ("original_audio_48k", "derived_audio_16k")
+CANONICAL_AUDIO_KINDS = ("audio_opus",)
 SOURCE_AUDIO_KINDS = ("source_microphone", "source_system", "source_browser", "mixed_master")
-FILE_KINDS = AUDIO_KINDS + SOURCE_AUDIO_KINDS + ("attachment",)
+FILE_KINDS = AUDIO_KINDS + CANONICAL_AUDIO_KINDS + SOURCE_AUDIO_KINDS + ("attachment",)
 MEETING_STATUSES = ("recording", "recorded", "transcribed", "analyzing", "completed", "failed")
 JOB_TYPES = ("transcription", "analysis", "profiling")
-JOB_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
+JOB_STATUSES = ("queued", "running", "cancelling", "succeeded", "failed", "cancelled")
 # Voice-profile matching states. Clear automatic matches and explicit user
 # decisions are confirmed; uncertain matches may remain suggested or unassigned.
 SPEAKER_ASSIGNMENT_STATUSES = ("suggested", "confirmed", "rejected")
@@ -156,7 +159,7 @@ class MeetingFile(Base):
             f"NOT {_IS_ATTACHMENT} OR original_filename ~* '{_EXTENSION_RE}'",
             name="attachment_extension_allowed",
         ),
-        # One original and one derived audio track per meeting.
+        # One original and one derived audio track per meeting (legacy WAV).
         Index(
             "uq_meeting_files_original_audio",
             "meeting_id",
@@ -168,6 +171,13 @@ class MeetingFile(Base):
             "meeting_id",
             unique=True,
             postgresql_where=text(f"kind = 'derived_audio_16k'"),
+        ),
+        # One canonical compressed Opus artifact per meeting (new recordings).
+        Index(
+            "uq_meeting_files_audio_opus",
+            "meeting_id",
+            unique=True,
+            postgresql_where=text(f"kind = 'audio_opus'"),
         ),
         Index("ix_meeting_files_meeting_id", "meeting_id"),
     )
@@ -188,6 +198,9 @@ class MeetingFile(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sample_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
     channels: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    codec: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    bitrate_kbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    container: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
 
@@ -296,8 +309,10 @@ class ProcessingJob(Base):
         ),
         Index("uq_processing_jobs_active", "meeting_id", "job_type",
               unique=True,
-              postgresql_where=text("status IN ('queued', 'running')")),
+              postgresql_where=text("status IN ('queued', 'running', 'cancelling')")),
         Index("ix_processing_jobs_meeting_id", "meeting_id"),
+        Index("ix_processing_jobs_status_heartbeat", "status", "heartbeat_at"),
+        Index("ix_processing_jobs_status_next_run", "status", "next_run_at"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -311,10 +326,17 @@ class ProcessingJob(Base):
     progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default=text("0"))
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     model: Mapped[str | None] = mapped_column(Text, nullable=True)
     fallback_from: Mapped[str | None] = mapped_column(String(32), nullable=True)
     fallback_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default=text("3"))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = _created_at()
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -410,9 +432,19 @@ class SpeakerEmbedding(Base):
         nullable=True,
     )
     best_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    second_best_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("meeting_analyzer.speaker_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    second_best_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_gap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ambiguity_margin_used: Mapped[float | None] = mapped_column(Float, nullable=True)
     decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     profiles_evaluated: Mapped[int | None] = mapped_column(Integer, nullable=True)
     match_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    all_scores: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     evaluated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -89,6 +89,21 @@ class _NullRunner:
     def stop(self):
         pass
 
+    def health(self):
+        return {
+            "running": True,
+            "thread_alive": True,
+            "db_read_only": False,
+            "degraded_reason": None,
+            "last_error": None,
+            "last_loop_at": "2026-01-01T00:00:00+00:00",
+            "last_claim_at": None,
+            "last_recovery_at": None,
+            "stalled": False,
+            "stall_seconds": 0.0,
+            "stale_running_seconds": 900,
+        }
+
 
 def _build_fake_transcription():
     from ai.transcription import TranscriptionService
@@ -192,7 +207,10 @@ class TestMeetingCreation:
         assert meeting["status"] == "recorded"
         files = api.get(f"/meetings/{meeting['id']}/files").json()
         kinds = sorted(f["kind"] for f in files)
-        assert kinds == ["derived_audio_16k", "original_audio_48k"]
+        assert kinds == ["audio_opus"]
+        audio = files[0]
+        assert audio["mime_type"] == "audio/ogg"
+        assert audio["codec"] == "opus"
 
     def test_rejects_empty_upload(self, api, user_headers_and_id):
         _headers, user_id = user_headers_and_id
@@ -220,7 +238,7 @@ class TestStreaming:
         _headers, user_id = user_headers_and_id
         meeting = _ingest_meeting(api, user_id)
         files = api.get(f"/meetings/{meeting['id']}/files").json()
-        original = next(f for f in files if f["kind"] == "original_audio_48k")
+        original = next(f for f in files if f["kind"] in ("audio_opus", "original_audio_48k"))
         response = api.get(f"/files/{original['id']}")
         assert response.status_code == 200
         assert response.headers["X-File-SHA256"] == original["sha256"]
@@ -232,7 +250,7 @@ class TestStreaming:
         _headers, user_id = user_headers_and_id
         meeting = _ingest_meeting(api, user_id)
         files = api.get(f"/meetings/{meeting['id']}/files").json()
-        original = next(f for f in files if f["kind"] == "original_audio_48k")
+        original = next(f for f in files if f["kind"] in ("audio_opus", "original_audio_48k"))
         response = api.get(
             f"/files/{original['id']}", headers={"Range": "bytes=10-19"}
         )
@@ -244,7 +262,7 @@ class TestStreaming:
         _headers, user_id = user_headers_and_id
         meeting = _ingest_meeting(api, user_id)
         files = api.get(f"/meetings/{meeting['id']}/files").json()
-        original = next(f for f in files if f["kind"] == "original_audio_48k")
+        original = next(f for f in files if f["kind"] in ("audio_opus", "original_audio_48k"))
         response = api.get(f"/files/{original['id']}/download")
         assert "attachment" in response.headers["Content-Disposition"]
 
@@ -338,7 +356,8 @@ class TestTranscriptAndAnalysis:
         job = _transcribe(api, meeting["id"])
         _run_job(api, job["id"])
         jobs = api.get(f"/meetings/{meeting['id']}/jobs").json()
-        assert jobs[0]["status"] == "succeeded"
+        transcription_job = next(j for j in jobs if j["id"] == job["id"])
+        assert transcription_job["status"] == "succeeded"
         transcripts = api.get(f"/meetings/{meeting['id']}/transcripts").json()
         assert len(transcripts) == 1
         assert transcripts[0]["is_primary"] is True
@@ -365,8 +384,8 @@ class TestTranscriptAndAnalysis:
         assert api.get(f"/meetings/{meeting['id']}/transcripts").json() == []
 
         again = api.post(f"/meetings/{meeting['id']}/jobs/{job['id']}/cancel")
-        assert again.status_code == 404
-        assert again.json()["error"]["code"] == "job_not_cancellable"
+        assert again.status_code == 200
+        assert again.json()["status"] == "cancelled"
 
     def test_analysis_flow(self, api, user_headers_and_id, monkeypatch):
         monkeypatch.setenv("TEAMMEETINGAI_ANALYSIS_BACKEND", "groq")
@@ -415,7 +434,8 @@ class TestTranscriptAndAnalysis:
         _run_job(api, response.json()["id"])
 
         jobs = api.get(f"/meetings/{meeting['id']}/jobs").json()
-        assert jobs[0]["status"] == "succeeded", jobs[0]
+        analysis_job = next(j for j in jobs if j["id"] == response.json()["id"])
+        assert analysis_job["status"] == "succeeded", analysis_job
         summary = api.get(f"/meetings/{meeting['id']}/summary").json()
         assert summary["overview"] == "The team agreed to ship the release."
         items = api.get(f"/meetings/{meeting['id']}/action-items").json()
@@ -544,8 +564,8 @@ class TestDeletion:
                     text("SELECT COUNT(*) FROM pg_largeobject_metadata")
                 ).scalar_one()
             )
-        # 3 LOs existed (2 audio + 1 attachment) and all are gone.
-        assert after == before - 3
+        # 2 LOs existed (1 canonical audio + 1 attachment) and all are gone.
+        assert after == before - 2
 
     def test_remote_profile_can_delete(self, api, user_headers_and_id):
         _headers, user_id = user_headers_and_id
@@ -594,10 +614,10 @@ class TestSearchAndSystem:
         status = api.get("/system/status").json()
         assert status["meeting_count"] == 1
         assert status["db_size_bytes"] > 0
-        assert status["schema_version"] == "0004_meeting_task_sync"
+        assert status["schema_version"] == "0009_audio_opus"
         assert status["can_record"] is True
 
     def test_health(self, api):
         response = api.get("/health").json()
         assert response["status"] == "ok"
-        assert response["schema"] == "0004_meeting_task_sync"
+        assert response["schema"] == "0009_audio_opus"

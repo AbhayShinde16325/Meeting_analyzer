@@ -7,7 +7,7 @@ from sqlalchemy import text
 
 from db.session import SchemaTooNewError, ensure_schema_current
 
-EXPECTED_REVISION = "0004_meeting_task_sync"
+EXPECTED_REVISION = "0009_audio_opus"
 
 
 def test_current_schema_is_accepted(pg_engine):

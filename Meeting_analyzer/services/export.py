@@ -160,14 +160,17 @@ def build_export(
                 json.dumps(dict(summary), ensure_ascii=False, indent=2, default=str),
             )
         if include_audio:
-            original = next((f for f in files if f["kind"] == "original_audio_48k"), None)
+            original = next((f for f in files if f["kind"] == "audio_opus"), None)
+            if original is None:
+                original = next((f for f in files if f["kind"] == "original_audio_48k"), None)
             if original is not None:
                 lo_file = _LargeObjectFile(
                     conn, int(original["lo_oid"]), int(original["size_bytes"])
                 )
-                with archive.open(
-                    f"audio/{original['original_filename'] or 'audio.wav'}", "w"
-                ) as destination:
+                name = original["original_filename"]
+                if not name:
+                    name = "audio.ogg" if original["kind"] == "audio_opus" else "audio.wav"
+                with archive.open(f"audio/{name}", "w") as destination:
                     shutil.copyfileobj(lo_file, destination, length=1024 * 1024)
         for attachment in (f for f in files if f["kind"] == "attachment"):
             lo_file = _LargeObjectFile(

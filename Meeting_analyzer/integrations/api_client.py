@@ -348,11 +348,16 @@ class TeamMeetingAIClient:
             "POST", f"/meetings/{meeting_id}/jobs/{job_id}/cancel"
         )  # type: ignore[return-value]
 
+    def requeue_job(self, meeting_id: str, job_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST", f"/meetings/{meeting_id}/jobs/{job_id}/requeue"
+        )  # type: ignore[return-value]
+
     def active_jobs(self, meeting_id: str) -> list[dict[str, Any]]:
-        """Jobs of this meeting that are queued or running."""
+        """Jobs of this meeting that are queued, running, or cancelling."""
 
         jobs = self.list_jobs(meeting_id)
-        return [job for job in jobs if job.get("status") in ("queued", "running")]
+        return [job for job in jobs if job.get("status") in ("queued", "running", "cancelling")]
 
     # -- search / export ------------------------------------------------------
 

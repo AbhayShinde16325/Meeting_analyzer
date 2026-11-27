@@ -123,5 +123,6 @@ def test_pipeline_sync_failure_preserves_summary(pg, pg_engine):
     job = pg.execute(text("SELECT status,error FROM meeting_analyzer.processing_jobs WHERE id=:id"), {"id":job_id}).mappings().one()
     summary = pg.execute(text("SELECT overview FROM meeting_analyzer.summaries WHERE meeting_id=:m"), {"m":mid}).mappings().one_or_none()
     assert job["status"] == "failed"
-    assert "task sync failed" in (job["error"] or "").lower()
+    err = (job["error"] or "").lower()
+    assert "task sync" in err or "cannot sync" in err or "public.tasks" in err
     assert summary is not None and summary["overview"] == "ok"

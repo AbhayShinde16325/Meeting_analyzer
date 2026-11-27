@@ -32,29 +32,58 @@ export default function MeetingDetailsPage() {
       ])
       setData({ meeting, files, transcripts, summary, actionItems, jobs, speakers, metrics, profiles })
       setError('')
-    } catch (e) { setError(e.message) }
+      pollFailuresRef.current = 0
+    } catch (e) {
+      setError(e.message)
+      pollFailuresRef.current = Math.min((pollFailuresRef.current || 0) + 1, 6)
+    }
     finally { setLoading(false) }
   }
 
   useEffect(() => { load() }, [meetingId])
 
   const primary = useMemo(() => data.transcripts.find(t => t.is_primary) || data.transcripts[0], [data.transcripts])
-  const audio = useMemo(() => data.files.find(f => f.kind === 'original_audio_48k') || data.files.find(f => (f.kind || '').startsWith('original_audio')), [data.files])
+  const audio = useMemo(
+    () => data.files.find(f => f.kind === 'audio_opus')
+      || data.files.find(f => f.kind === 'original_audio_48k')
+      || data.files.find(f => (f.kind || '').startsWith('original_audio'))
+      || data.files.find(f => f.kind === 'derived_audio_16k'),
+    [data.files]
+  )
   const attachments = useMemo(() => data.files.filter(f => f.kind === 'attachment'), [data.files])
-  const activeJob = data.jobs.find(j => ['queued', 'running'].includes(j.status))
+  const activeJob = data.jobs.find(j => ['queued', 'running', 'cancelling'].includes(j.status))
   const profilingJob = useMemo(() => data.jobs.find(j => j.job_type === 'profiling') || null, [data.jobs])
   const lastProfilingStatus = useRef(null)
+  const pollFailuresRef = useRef(0)
+  const staleActiveJob = useMemo(() => {
+    if (!activeJob || !['running', 'cancelling'].includes(activeJob.status)) return false
+    const ts = activeJob.heartbeat_at || activeJob.updated_at || activeJob.started_at || activeJob.created_at
+    if (!ts) return false
+    const ageMs = Date.now() - new Date(ts).getTime()
+    return Number.isFinite(ageMs) && ageMs > 15 * 60 * 1000
+  }, [activeJob])
 
   useEffect(() => {
-    const active = data.jobs?.some(j => ['queued', 'running'].includes(j.status)) || ['recorded', 'transcribed', 'analyzing'].includes(data.meeting?.status)
+    const active = data.jobs?.some(j => ['queued', 'running', 'cancelling'].includes(j.status)) || ['recorded', 'transcribed', 'analyzing'].includes(data.meeting?.status)
     if (!active) return
-    const t = setInterval(() => load(true), 4000)
-    return () => clearInterval(t)
+    let cancelled = false
+    let timer = null
+    const schedule = (delay) => {
+      if (cancelled) return
+      timer = setTimeout(async () => {
+        await load(true)
+        if (cancelled) return
+        const delayNext = pollFailuresRef.current > 0 ? Math.min(30000, 4000 * (2 ** Math.min(pollFailuresRef.current, 3))) : 4000
+        schedule(delayNext)
+      }, delay)
+    }
+    schedule(4000)
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
   }, [data.jobs, data.meeting?.status, meetingId])
   useEffect(() => {
     const s = profilingJob?.status || null
     const prev = lastProfilingStatus.current
-    if (prev && ['queued', 'running'].includes(prev) && s && ['succeeded', 'failed', 'cancelled'].includes(s)) {
+    if (prev && ['queued', 'running', 'cancelling'].includes(prev) && s && ['succeeded', 'failed', 'cancelled'].includes(s)) {
       load(true)
     }
     lastProfilingStatus.current = s
@@ -132,14 +161,20 @@ export default function MeetingDetailsPage() {
           <button className="btn" disabled={!canManage || busy === 'transcribe'} onClick={() => act('transcribe', () => api.transcribe(meetingId))}>{busy === 'transcribe' ? '...' : 'Transcribe'}</button>
           <button className="btn" disabled={!canManage || busy === 'analyse' || !primary} title={!primary ? 'Transcribe first' : 'Extract summary and action items'} onClick={() => act('analyse', () => api.analyse(meetingId))}>{busy === 'analyse' ? '...' : 'Analyse'}</button>
           <button className="btn" disabled={!canManage || busy === 'profile'} onClick={() => act('profile', () => api.requestProfiling(meetingId))}>{busy === 'profile' ? '...' : 'Profile speakers'}</button>
-          <button className="btn" disabled={!canManage || !activeJob || busy === 'cancel'} onClick={() => act('cancel', () => api.cancelJob(meetingId, activeJob.id))}>Cancel job</button>
+          <button className="btn" disabled={!canManage || !activeJob || activeJob.status === 'cancelling' || busy === 'cancel'} onClick={() => act('cancel', () => api.cancelJob(meetingId, activeJob.id))}>{activeJob?.status === 'cancelling' ? 'Cancelling...' : 'Cancel job'}</button>
           <button className="btn" onClick={() => api.exportMeeting(meetingId).catch(e => setError(e.message))}>Export ZIP</button>
           {canManage && <button className="btn danger" disabled={busy === 'delete'} onClick={() => { if (confirm(`Delete "${m.title}" permanently?`)) act('delete', async () => { await api.deleteMeeting(meetingId); nav('/') }) }}>Delete</button>}
         </div>
       </div>
 
       {error && <div className="alert error">{error}</div>}
-      {activeJob && <div className="alert info">Job {activeJob.job_type}: {activeJob.status} {Math.round((activeJob.progress || 0) * 100)}% {activeJob.message ? `— ${activeJob.message}` : ''}</div>}
+      {activeJob && (
+        <div className={`alert ${staleActiveJob ? 'error' : 'info'}`}>
+          Job {activeJob.job_type}: {activeJob.status} {Math.round((activeJob.progress || 0) * 100)}%
+          {activeJob.message ? ` — ${activeJob.message}` : ''}
+          {staleActiveJob ? ' — This job appears stalled (no heartbeat/update for 15+ minutes). It should be recovered automatically when the worker is healthy; if it remains stuck, check server health and requeue manually.' : ''}
+        </div>
+      )}
 
       <div className="card">
         <div className="section-title">Audio</div>
@@ -209,21 +244,49 @@ export default function MeetingDetailsPage() {
             const selected = sp.profile_id || ''
             return (
               <div key={sp.local_label} className="speaker-row" style={{ alignItems: 'flex-start' }}>
-                <div style={{ minWidth: 320 }}>
+                <div style={{ minWidth: 320, flex: 1 }}>
                   <div className="speaker-name">{sp.local_label} {sp.profile_name ? <span className="muted">→ {sp.profile_name}</span> : <span className="muted">→ Unknown</span>}</div>
                   <div className="muted small">
                     Segments: {fmtNum(sp.segment_count)} • Speech: {(sp.speech_seconds || 0).toFixed(1)}s • Assignment: {sp.status || 'unassigned'}{sp.origin ? ` (${sp.origin})` : ''}
                   </div>
                   <div className="muted small">
-                    Reference available: {sp.reference_available ? 'Yes' : 'No'} • Best ref: {sp.best_profile_name || '—'} • Similarity: {fmtPct(sp.best_score)} • Threshold: {fmtPct(sp.threshold)}
+                    Reference available: {sp.reference_available ? 'Yes' : 'No'} • Reference samples: {fmtNum(sp.reference_count)} • Profiles evaluated: {fmtNum(sp.profiles_evaluated)}
                   </div>
                   <div className="muted small">
-                    Decision: {decisionLabel(sp.decision)} • Profiles evaluated: {fmtNum(sp.profiles_evaluated)} • Evaluated: {sp.evaluated_at ? formatDate(sp.evaluated_at) : '—'}
+                    Best: {sp.best_profile_name || '—'} ({fmtPct(sp.best_score)}) • 2nd: {sp.second_best_profile_name || '—'} ({fmtPct(sp.second_best_score)}) • Gap: {sp.score_gap == null ? '—' : Number(sp.score_gap).toFixed(4)}
                   </div>
                   <div className="muted small">
-                    Job: {sp.job_status || profilingJob?.status || '—'} • Processing time: {fmtDur(profilingJob)} • Error: {sp.job_error || profilingJob?.error || '—'}
+                    Threshold: {fmtPct(sp.threshold)} • Ambiguity margin: {sp.ambiguity_margin == null ? '—' : Number(sp.ambiguity_margin).toFixed(4)} • Decision: {decisionLabel(sp.decision)}
+                  </div>
+                  <div className="muted small">Reason: {sp.decision_reason || '—'}</div>
+                  <div className="muted small">
+                    Evaluated: {sp.evaluated_at ? formatDate(sp.evaluated_at) : '—'} • Job: {sp.job_status || profilingJob?.status || '—'} • Processing: {fmtDur(profilingJob)} • Error: {sp.job_error || profilingJob?.error || '—'}
                   </div>
                   {(sp.same_voice_labels || []).length > 0 && <div className="muted small">Same voice as: {sp.same_voice_labels.join(', ')}</div>}
+                  <details style={{ marginTop: 8 }}>
+                    <summary className="muted small" style={{ cursor: 'pointer' }}>Score matrix (all profiles)</summary>
+                    {(sp.all_scores || []).length === 0 ? <div className="muted small">No score matrix available. Re-run Profile Speakers.</div> : (
+                      <div className="table-wrap" style={{ marginTop: 6 }}>
+                        <table>
+                          <thead><tr><th>Profile</th><th>Score</th><th>Has reference</th><th>Top</th></tr></thead>
+                          <tbody>
+                            {sp.all_scores.map((r) => {
+                              const isBest = sp.best_profile_id && String(r.profile_id) === String(sp.best_profile_id)
+                              const isSecond = sp.second_best_profile_id && String(r.profile_id) === String(sp.second_best_profile_id)
+                              return (
+                                <tr key={String(r.profile_id)}>
+                                  <td>{r.profile_name || String(r.profile_id)}</td>
+                                  <td>{r.score == null ? '—' : `${(Number(r.score) * 100).toFixed(2)}%`}</td>
+                                  <td>{r.has_reference === false ? 'No' : 'Yes'}</td>
+                                  <td>{isBest ? 'Best' : isSecond ? '2nd' : ''}</td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </details>
                 </div>
                 <div className="speaker-actions" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                   <select disabled={!canManage || busy === `speaker:${sp.local_label}`} value={selected} onChange={e => onAssignSpeaker(sp.local_label, { profile_id: e.target.value || null, status: 'confirmed' })}>

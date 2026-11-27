@@ -35,6 +35,10 @@ def bad_request(code: str, message: str) -> ApiError:
     return ApiError(http_status.HTTP_400_BAD_REQUEST, code, message)
 
 
+def conflict(code: str, message: str) -> ApiError:
+    return ApiError(http_status.HTTP_409_CONFLICT, code, message)
+
+
 def _envelope(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
 

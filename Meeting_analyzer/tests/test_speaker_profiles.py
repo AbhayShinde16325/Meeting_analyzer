@@ -279,9 +279,26 @@ class TestMatchingDecision:
         assert decide(0.74, 0.70, 2, 0.70, 0.05) == "ambiguous"
         # difference exactly 0.05 => not ambiguous
         assert decide(0.75, 0.70, 2, 0.70, 0.05) == "matched"
-        # second below threshold does not create ambiguity
-        assert decide(0.70, 0.69, 2, 0.70, 0.05) == "matched"
+        # top-two gap within margin is ambiguous even if second is below threshold
+        assert decide(0.70, 0.69, 2, 0.70, 0.05) == "ambiguous"
 
     def test_no_reference(self):
         decide = sp.SpeakerProfileService._decision
         assert decide(0.95, None, 0, 0.70, 0.05) == "no_reference"
+
+    def test_decision_detail_includes_reason_and_gap(self):
+        decision, reason = sp.SpeakerProfileService._decision_detail(0.74, 0.70, 2, 0.70, 0.05)
+        assert decision == "ambiguous"
+        assert "ambiguity margin" in reason.lower()
+        assert "0.0400" in reason
+
+    def test_regression_absent_profile_must_not_match_when_ambiguous(self):
+        # Absent person's profile is top score, but another profile is within margin.
+        decision, reason = sp.SpeakerProfileService._decision_detail(0.73, 0.69, 2, 0.70, 0.05)
+        assert decision == "ambiguous"
+        assert "Unknown" in reason or "unknown" in reason.lower()
+
+    def test_regression_absent_profile_must_not_match_when_below_threshold(self):
+        decision, reason = sp.SpeakerProfileService._decision_detail(0.69, 0.10, 2, 0.70, 0.05)
+        assert decision == "below_threshold"
+        assert "below threshold" in reason.lower()

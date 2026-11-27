@@ -313,3 +313,40 @@ class TestPrimaryTranscript:
 class TestUniqueIds:
     def test_ids_are_uuid4(self, pg, user_id, meeting_id):
         assert uuid.UUID(str(meeting_id)).version == 4
+
+
+class TestAudioOpusMigration:
+    def test_audio_opus_columns_and_index_exist(self, pg, meeting_id):
+        cols = {r[0] for r in pg.execute(text(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='meeting_analyzer' AND table_name='meeting_files'
+            """
+        )).all()}
+        assert {'codec', 'bitrate_kbps', 'container'}.issubset(cols)
+        idx = {r[0] for r in pg.execute(text(
+            """
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname='meeting_analyzer' AND tablename='meeting_files'
+            """
+        )).all()}
+        assert 'uq_meeting_files_audio_opus' in idx
+        # kind constraint allows audio_opus
+        pg.execute(text(
+            """
+            INSERT INTO meeting_analyzer.meeting_files
+            (id, meeting_id, kind, lo_oid, sha256, size_bytes, mime_type, codec, bitrate_kbps, container)
+            VALUES (gen_random_uuid(), :m, 'audio_opus', 0, 'x', 1, 'audio/ogg', 'opus', 32, 'ogg')
+            """
+        ), {"m": meeting_id})
+        # should fail on unique constraint for second audio_opus, not kind constraint
+        with pytest.raises(Exception):
+            pg.execute(text(
+                """
+                INSERT INTO meeting_analyzer.meeting_files
+                (id, meeting_id, kind, lo_oid, sha256, size_bytes, mime_type)
+                VALUES (gen_random_uuid(), :m, 'audio_opus', 0, 'y', 1, 'audio/ogg')
+                """
+            ), {"m": meeting_id})
+            pg.commit()
+        pg.rollback()

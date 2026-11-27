@@ -89,9 +89,9 @@ def create_meeting(
 ) -> dict:
     """Ingest a finished recording.
 
-    Stores the original WAV and its 16 kHz mono derivative as Large Objects
-    and queues a transcription job.  Note: audio is sent to Sarvam (cloud)
-    during transcription; participant consent is disclosed in the UI.
+    Converts uploaded audio to canonical Ogg Opus (32 kbps, mono, 16 kHz, VBR),
+    stores only the compressed Opus artifact as a Large Object, and queues a
+    transcription job. Temporary source/converted files are deleted after ingest.
     """
 
     effective_user = user_id or profile.get("id")
